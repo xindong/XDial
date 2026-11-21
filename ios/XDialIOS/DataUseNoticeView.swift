@@ -151,8 +151,8 @@ enum DataUseNotice {
             Section(title: t("数据存储与同步", "Storage and sync"), symbol: "iphone", points: [
                 t("iCloud 同步默认开启。确认本说明后，配置、已保存的 Wi-Fi 匹配规则、偏好、VPN 密码和订阅地址会同步到你的私人 iCloud，供同一 Apple 账号的设备使用。你可以在继续前或之后的设置中关闭同步。",
                   "iCloud Sync is on by default. After you confirm this notice, XDial syncs configuration, saved Wi-Fi matching rules, preferences, VPN passwords and subscription URLs to your private iCloud for devices using the same Apple Account. You can turn sync off before continuing or later in Settings."),
-                t("Wi-Fi 名称仅在本机匹配。若启用地点场景，连接 VPN 时会在后台比对已保存地点。坐标仅用于本机匹配，不随配置导出。",
-                  "Wi-Fi names are matched on device. If you enable location scenarios, XDial checks saved places in the background while connected. Coordinates are matched locally and excluded from configuration exports."),
+                t("Wi-Fi 名称仅在本机匹配。若启用地点场景，连接 VPN 时会在后台比对已保存地点。若启用后台网速，XDial 会使用后台定位来持续采样网速。坐标仅用于本机匹配，不随配置导出。",
+                  "Wi-Fi names are matched on device. If you enable location scenarios, XDial checks saved places in the background while connected. If you enable background speed updates, XDial uses background location to keep sampling network speeds. Coordinates are matched locally and excluded from configuration exports."),
                 t("连接记录和诊断信息（含出口 IP 地址）保存在本机，只有你主动导出或分享时才会离开设备。",
                   "Connection history and diagnostics (including exit IP addresses) stay on the device and leave it only when you export or share them."),
             ]),

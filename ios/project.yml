@@ -184,7 +184,7 @@ targets:
         XDialAppGroupIdentifier: $(XDIAL_APP_GROUP)
         XDialTunnelBundleIdentifier: $(XDIAL_BUNDLE_ID).tunnel
         UIBackgroundModes: [location]
-        NSLocationWhenInUseUsageDescription: XDial uses your location to match saved places and switch VPN scenarios, including while connected in the background.
+        NSLocationWhenInUseUsageDescription: When you enable background speed updates or switching scenarios at saved places, XDial uses location in the background while the VPN is connected.
         # 与 App Store Connect 填写的隐私政策一致；数据使用说明和设置里链接到这里。
         XDialPrivacyPolicyURL: https://xindong.github.io/XDial/privacy/
     entitlements:

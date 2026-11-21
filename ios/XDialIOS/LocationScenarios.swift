@@ -56,6 +56,7 @@ final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDele
     private weak var app: AppState?
     private var subscriptions: Set<AnyCancellable> = []
     private var tracking = false
+    private var requestedSpeedAuthorization = false
     private var saveTimeout: Task<Void, Never>?
 
     func attach(_ app: AppState) {
@@ -136,27 +137,46 @@ final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDele
     }
 
     func reconcile() {
+        let speedEnabled = app?.dataUseNoticeAccepted == true
+            && ConnectionActivityController.isEnabledByUser
+            && UserDefaults.standard.bool(forKey: ConnectionActivityController.backgroundSpeedKey)
+        if speedEnabled, manager.authorizationStatus == .notDetermined {
+            if !requestedSpeedAuthorization, UIApplication.shared.applicationState == .active {
+                requestedSpeedAuthorization = true
+                manager.requestWhenInUseAuthorization()
+            }
+        } else {
+            requestedSpeedAuthorization = false
+        }
         let authorized = authorization == .authorizedWhenInUse || authorization == .authorizedAlways
         if authorization == .denied || authorization == .restricted || (authorized && !precise) { saving = nil }
         let monitor = shouldMonitor && authorized && precise
-        let want = monitor || (saving != nil && authorized)
+        let status = app?.engine.status
+        let backgroundSpeed = speedEnabled && authorized
+            && (status == "connected" || (tracking && status == "reconnecting"))
+        let background = monitor || backgroundSpeed
+        let want = background || (saving != nil && authorized)
         if !monitor || !eligiblePlaces.contains(where: { $0.scenarioID == match?.scenarioID }) { publish(nil) }
-        manager.allowsBackgroundLocationUpdates = monitor
+        manager.allowsBackgroundLocationUpdates = background
+        manager.desiredAccuracy = monitor || saving != nil ? kCLLocationAccuracyHundredMeters : kCLLocationAccuracyKilometer
         if want && !tracking && UIApplication.shared.applicationState == .active {
             tracking = true
             manager.startUpdatingLocation()
+        } else if !want && tracking {
+            manager.stopUpdatingLocation()
+            tracking = false
+        }
+        if tracking && monitor && renewalTimer == nil {
             renewalTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    guard let self, self.tracking else { return }
+                    guard let self, self.shouldMonitor, self.precise else { return }
                     self.renewalManager.requestLocation()
                 }
             }
-        } else if !want && tracking {
+        } else if !monitor && renewalTimer != nil {
             renewalTimer?.invalidate()
             renewalTimer = nil
             renewalManager.stopUpdatingLocation()
-            manager.stopUpdatingLocation()
-            tracking = false
         }
     }
 
@@ -184,7 +204,7 @@ final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDele
             persist()
             reconcile()
         }
-        guard shouldMonitor else { return }
+        guard shouldMonitor, precise else { return }
         let id = ScenarioPlace.match(location, in: eligiblePlaces, previous: match?.scenarioID)
         // Renew only periodically; ordinary samples should not rebuild the tunnel catalog.
         if id == match?.scenarioID, let match, match.expires.timeIntervalSinceNow > 300 { return }

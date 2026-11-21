@@ -1,1 +1,1 @@
-"NSLocationWhenInUseUsageDescription" = "XDial 使用当前位置匹配已保存的地点，并在 VPN 连接期间根据地点自动切换场景，包括在后台使用时。";
+"NSLocationWhenInUseUsageDescription" = "连接 VPN 时，XDial 会按你开启的功能使用后台定位，以持续更新网速或根据已保存的地点切换场景。";
