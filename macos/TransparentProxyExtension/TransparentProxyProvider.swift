@@ -126,7 +126,7 @@ private final class ProviderApplicationAttributionLedger:
     }
 }
 
-final class TransparentProxyProvider: NETransparentProxyProvider {
+final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPFlowHandling {
     private static let profileOption = "profile"
     private static let underlayInterfacesOption = "underlay_interfaces"
     private static let underlayDefaultNameOption = "underlay_default_name"
@@ -2299,6 +2299,19 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
+        accept(flow, initialUDPEndpoint: nil)
+    }
+
+    func handleNewUDPFlow(
+        _ flow: NEAppProxyUDPFlow,
+        initialRemoteFlowEndpoint remoteEndpoint: Network.NWEndpoint
+    ) -> Bool {
+        accept(flow, initialUDPEndpoint: remoteEndpoint)
+    }
+
+    private func accept(
+        _ flow: NEAppProxyFlow, initialUDPEndpoint: Network.NWEndpoint?
+    ) -> Bool {
         // Transparent Proxy 返回 false 会让系统按原网络路径放行。只允许在启动前或显式
         // 停止后的无会话窗口这样做；active 会话内的 TCP/UDP 转发失败必须由 relay 关流。
         let reservation: ProviderRelayRegistry<
@@ -2339,6 +2352,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             // 被替换时只拆 association，由 supervisor 换代重建。
             UDPFlowSOCKSRelay.start(
                 flow: udpFlow,
+                initialEndpoint: initialUDPEndpoint,
                 initialTicket: udpAssociationTicket(
                     reservation: reservation,
                     credentials: credentials

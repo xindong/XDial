@@ -60,13 +60,14 @@ enum UDPFlowSOCKSRelay {
 
     static func start(
         flow: NEAppProxyUDPFlow,
+        initialEndpoint: Network.NWEndpoint?,
         initialTicket: AssociationTicket,
         nextTicket: @escaping @Sendable () -> AssociationTicket?,
         policy: RelayReassociationPolicy = .default,
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) {
-        let channel = UDPFlowChannel(flow: flow)
+        let channel = UDPFlowChannel(flow: flow, initialEndpoint: initialEndpoint)
         Task.detached(priority: .userInitiated) {
             await supervise(
                 channel: channel,
@@ -823,12 +824,13 @@ private final class UDPAssociation: @unchecked Sendable {
 /// Owns the application-facing flow across every association it outlives.
 private final class UDPFlowChannel: @unchecked Sendable {
     let flow: NEAppProxyUDPFlow
-    let codec = UDPRelayDatagramCodec()
+    let codec: UDPRelayDatagramCodec
 
     private let associationSlot = RelayAssociationSlot<UDPAssociation>()
 
-    init(flow: NEAppProxyUDPFlow) {
+    init(flow: NEAppProxyUDPFlow, initialEndpoint: Network.NWEndpoint?) {
         self.flow = flow
+        codec = UDPRelayDatagramCodec(initialDestination: initialEndpoint)
     }
 
     var isClosed: Bool {

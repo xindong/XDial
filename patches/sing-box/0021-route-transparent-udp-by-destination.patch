@@ -1,0 +1,372 @@
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -73,7 +73,16 @@
+ }
+ 
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
++	var packetListener socks.PacketListener = h.listener
++	packetHandler := h.streamUserPacketConnection
++	if h.xdialFlowMetadata {
++		association := &xdialUDPListener{PacketListener: h.listener, control: conn}
++		packetListener = association
++		packetHandler = func(ctx context.Context, packets N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.routeXDialUDP(ctx, association, packets, metadata, onClose)
++		}
++	}
++	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, packetHandler), packetListener, h.udpTimeout, metadata.Source, onClose)
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+@@ -109,23 +118,6 @@
+ func (h *Inbound) streamUserPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	if h.xdialFlowMetadata {
+-		boundMarker := isXDialBoundAssociationMarker(metadata.Destination)
+-		encoded, err := applyXDialFlowMetadata(&metadata)
+-		if encoded && err != nil {
+-			N.CloseOnHandshakeFailure(conn, onClose, err)
+-			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
+-			return
+-		}
+-		if boundMarker {
+-			conn, err = xdialAdoptBoundAssociation(conn, &metadata)
+-			if err != nil {
+-				N.CloseOnHandshakeFailure(conn, onClose, err)
+-				h.logger.ErrorContext(ctx, "read first datagram after XDial bound marker")
+-				return
+-			}
+-		}
+-	}
+ 	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		if !metadata.Destination.IsValid() {
+--- a/protocol/socks/xdial_bound_association.go
++++ b/protocol/socks/xdial_bound_association.go
+@@ -3,9 +3,7 @@
+ import (
+ 	"bytes"
+ 
+-	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ )
+@@ -17,8 +15,7 @@
+ // bound-interface envelope. The handler reads the interface from that first
+ // destination (applyXDialFlowMetadata) and this filter keeps every marker out
+ // of routing, so DNS forwarding and Direct dialing see the interface macOS
+-// bound the application socket to. The association destination then becomes
+-// the first real datagram's destination, exactly as without the marker.
++// bound the application socket to. Each real datagram retains its destination.
+ func isXDialBoundAssociationMarker(destination M.Socksaddr) bool {
+ 	return destination.IsDomain() &&
+ 		bytes.HasPrefix([]byte(destination.Fqdn), xdialBoundFlowMetadataMagic)
+@@ -56,19 +53,3 @@
+ func (c *xdialBoundMarkerFilterConn) Upstream() any {
+ 	return c.PacketConn
+ }
+-
+-// xdialAdoptBoundAssociation runs after applyXDialFlowMetadata consumed the
+-// marker destination. It reads past every marker to the first real datagram,
+-// restores that datagram as the association destination and keeps it cached
+-// for routing and sniffing.
+-func xdialAdoptBoundAssociation(conn N.PacketConn, metadata *adapter.InboundContext) (N.PacketConn, error) {
+-	filtered := newXDialBoundMarkerFilterConn(conn)
+-	packet := buf.NewPacket()
+-	destination, err := filtered.ReadPacket(packet)
+-	if err != nil {
+-		packet.Release()
+-		return conn, err
+-	}
+-	metadata.Destination = destination
+-	return bufio.NewCachedPacketConn(filtered, packet, destination), nil
+-}
+--- a/protocol/socks/xdial_bound_association_test.go
++++ b/protocol/socks/xdial_bound_association_test.go
+@@ -37,11 +37,11 @@
+ }
+ 
+ func (c *xdialQueuedPacketConn) WritePacket(*buf.Buffer, M.Socksaddr) error { return nil }
+-func (c *xdialQueuedPacketConn) Close() error                            { return nil }
+-func (c *xdialQueuedPacketConn) LocalAddr() net.Addr                     { return nil }
+-func (c *xdialQueuedPacketConn) SetDeadline(time.Time) error             { return nil }
+-func (c *xdialQueuedPacketConn) SetReadDeadline(time.Time) error         { return nil }
+-func (c *xdialQueuedPacketConn) SetWriteDeadline(time.Time) error        { return nil }
++func (c *xdialQueuedPacketConn) Close() error                               { return nil }
++func (c *xdialQueuedPacketConn) LocalAddr() net.Addr                        { return nil }
++func (c *xdialQueuedPacketConn) SetDeadline(time.Time) error                { return nil }
++func (c *xdialQueuedPacketConn) SetReadDeadline(time.Time) error            { return nil }
++func (c *xdialQueuedPacketConn) SetWriteDeadline(time.Time) error           { return nil }
+ 
+ func xdialBoundMarkerDestination(interfaceName string) M.Socksaddr {
+ 	raw := append([]byte(nil), xdialBoundFlowMetadataMagic...)
+@@ -62,14 +62,12 @@
+ 
+ 	// sing 已经把首个数据报（标记包）作为目标交出，连接里剩下的是后续数据报。
+ 	resolver := M.SocksaddrFrom(netip.MustParseAddr("100.100.100.100"), 53)
+-	conn, err := xdialAdoptBoundAssociation(&xdialQueuedPacketConn{packets: []xdialQueuedPacket{
++	conn := newXDialBoundMarkerFilterConn(&xdialQueuedPacketConn{packets: []xdialQueuedPacket{
+ 		{destination: marker, payload: []byte{0}},
+ 		{destination: resolver, payload: []byte{1, 2}},
+ 		{destination: marker, payload: []byte{0}},
+ 		{destination: resolver, payload: []byte{3}},
+-	}}, &metadata)
+-	require.NoError(t, err)
+-	require.Equal(t, resolver, metadata.Destination)
++	}})
+ 	require.Equal(t, "utun16", metadata.XDialBoundInterface)
+ 	for _, want := range [][]byte{{1, 2}, {3}} {
+ 		buffer := buf.NewPacket()
+@@ -124,9 +122,12 @@
+ 	metadata := adapter.InboundContext{Destination: firstDestination}
+ 	_, err = applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+-	conn, err := xdialAdoptBoundAssociation(cached, &metadata)
++	conn := newXDialBoundMarkerFilterConn(cached)
++	request := buf.NewPacket()
++	defer request.Release()
++	destination, err := conn.ReadPacket(request)
+ 	require.NoError(t, err)
+-	require.Equal(t, router, metadata.Destination)
++	require.Equal(t, router, destination)
+ 	require.Equal(t, "en1", metadata.XDialBoundInterface)
+ 
+ 	// 回包按复制循环的方式分配头部预留，再经 SOCKS 关联写回 App。
+@@ -144,7 +145,7 @@
+ 	require.NoError(t, err)
+ 	replyBuffer := buf.As(received[:n])
+ 	replyBuffer.Advance(3)
+-	destination, err := M.SocksaddrSerializer.ReadAddrPort(replyBuffer)
++	destination, err = M.SocksaddrSerializer.ReadAddrPort(replyBuffer)
+ 	require.NoError(t, err)
+ 	require.Equal(t, router, destination)
+ 	require.Equal(t, []byte{0, 128, 0, 0}, replyBuffer.Bytes())
+--- /dev/null
++++ b/protocol/socks/xdial_udp.go
+@@ -0,0 +1,223 @@
++package socks
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net"
++	"os"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/cache"
++	"github.com/sagernet/sing/common/canceler"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/common/pipe"
++	"github.com/sagernet/sing/protocol/socks"
++)
++
++const (
++	xdialUDPMaxDatagram = 65535
++	xdialUDPMaxTargets  = 64
++	xdialUDPQueueSize   = 16
++)
++
++// sing's SOCKS handshake discovers the UDP client by reading its first packet.
++// Keep that client address fixed while independently routed targets reply.
++type xdialUDPListener struct {
++	socks.PacketListener
++	control net.Conn
++	socket  *xdialUDPSocket
++}
++
++func (l *xdialUDPListener) ListenPacket(config net.ListenConfig, ctx context.Context, network, address string) (net.PacketConn, error) {
++	conn, err := l.PacketListener.ListenPacket(config, ctx, network, address)
++	if err != nil {
++		return nil, err
++	}
++	l.socket = &xdialUDPSocket{PacketConn: conn}
++	// UDP ASSOCIATE ends on control EOF, including while waiting for its first packet.
++	go func() {
++		_, _ = io.Copy(io.Discard, l.control)
++		_ = conn.Close()
++	}()
++	return l.socket, nil
++}
++
++type xdialUDPSocket struct {
++	net.PacketConn
++	peer  net.Addr // set during the handshake, before starting any writers
++	first []byte
++}
++
++// Only the upstream handshake uses ReadFrom. Its discovery buffer can be
++// smaller than the wire datagram. Replay the complete first packet to Read.
++func (s *xdialUDPSocket) ReadFrom(b []byte) (int, net.Addr, error) {
++	packet := buf.NewSize(xdialUDPMaxDatagram)
++	defer packet.Release()
++	n, peer, err := s.PacketConn.ReadFrom(packet.FreeBytes())
++	if err != nil {
++		return 0, nil, err
++	}
++	s.peer = peer
++	s.first = bytes.Clone(packet.FreeBytes()[:n])
++	return copy(b, s.first), peer, nil
++}
++
++func (s *xdialUDPSocket) Read(b []byte) (int, error) {
++	if s.first != nil {
++		n := copy(b, s.first)
++		s.first = nil
++		return n, nil
++	}
++	for {
++		n, peer, err := s.PacketConn.ReadFrom(b)
++		if err != nil || M.SocksaddrFromNet(peer) == M.SocksaddrFromNet(s.peer) {
++			return n, err
++		}
++	}
++}
++
++func (s *xdialUDPSocket) Write(b []byte) (int, error) { return s.WriteTo(b, s.peer) }
++func (s *xdialUDPSocket) RemoteAddr() net.Addr        { return s.peer }
++
++func (h *Inbound) routeXDialUDP(ctx context.Context, association *xdialUDPListener, handshake N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	ctx, cancel := context.WithCancel(ctx)
++	relay := socks.NewAssociatePacketConn(association.socket, M.Socksaddr{}, association.control)
++	ctx, packets := canceler.NewPacketConn(ctx, relay, h.udpTimeout)
++	stop := context.AfterFunc(ctx, func() { _ = association.socket.Close() })
++	var err error
++	defer func() {
++		stop()
++		cancel()
++		_ = packets.Close()
++		_ = handshake.Close()
++		if onClose != nil {
++			onClose(err)
++		}
++	}()
++
++	if isXDialBoundAssociationMarker(metadata.Destination) {
++		if _, err = applyXDialFlowMetadata(&metadata); err != nil {
++			h.logger.ErrorContext(ctx, "reject invalid XDial bound association")
++			return
++		}
++	}
++	reader := newXDialBoundMarkerFilterConn(packets)
++	targets := cache.New(
++		cache.WithSize[M.Socksaddr, *xdialUDPTarget](xdialUDPMaxTargets),
++		cache.WithEvict(func(_ M.Socksaddr, target *xdialUDPTarget) { target.Close() }),
++	)
++	packet := buf.NewSize(xdialUDPMaxDatagram)
++	defer packet.Release()
++	for {
++		packet.Reset()
++		var destination M.Socksaddr
++		destination, err = reader.ReadPacket(packet)
++		if err != nil {
++			return
++		}
++		target, ok := targets.Load(destination)
++		if !ok || target.ctx.Err() != nil {
++			peer := metadata
++			peer.Destination = destination
++			if _, err = applyXDialFlowMetadata(&peer); err != nil {
++				h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
++				continue
++			}
++			peerCtx, end := context.WithCancel(ctx)
++			target = &xdialUDPTarget{
++				ctx: peerCtx, end: end, writer: packets, local: relay.LocalAddr(),
++				destination: peer.Destination, queue: make(chan []byte, xdialUDPQueueSize),
++				deadline: pipe.MakeDeadline(),
++			}
++			targets.Store(destination, target)
++			timedCtx, timedConn := canceler.NewPacketConn(peerCtx, target, h.udpTimeout)
++			go h.streamUserPacketConnection(timedCtx, timedConn, peer, func(error) { end() })
++		}
++		// The association has one producer. A slow target drops its own excess
++		// datagrams without delaying another target's route or allocating a copy.
++		if len(target.queue) < cap(target.queue) {
++			target.queue <- bytes.Clone(packet.Bytes())
++		}
++	}
++}
++
++type xdialUDPTarget struct {
++	ctx         context.Context
++	end         context.CancelFunc
++	writer      N.PacketWriter
++	local       net.Addr
++	destination M.Socksaddr
++	queue       chan []byte
++	deadline    pipe.Deadline
++	readOptions N.ReadWaitOptions
++}
++
++func (p *xdialUDPTarget) nextPacket() ([]byte, error) {
++	select {
++	case <-p.ctx.Done():
++		return nil, net.ErrClosed
++	case <-p.deadline.Wait():
++		return nil, os.ErrDeadlineExceeded
++	case data := <-p.queue:
++		// Cancellation and a queued datagram can both be ready after eviction.
++		if p.ctx.Err() != nil {
++			return nil, net.ErrClosed
++		}
++		return data, nil
++	}
++}
++
++func (p *xdialUDPTarget) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	data, err := p.nextPacket()
++	if err != nil {
++		return M.Socksaddr{}, err
++	}
++	if len(data) > buffer.FreeLen() {
++		return M.Socksaddr{}, io.ErrShortBuffer
++	}
++	_, err = buffer.Write(data)
++	return p.destination, err
++}
++
++func (p *xdialUDPTarget) InitializeReadWaiter(options N.ReadWaitOptions) bool {
++	p.readOptions = options
++	return false
++}
++
++func (p *xdialUDPTarget) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
++	data, err := p.nextPacket()
++	if err != nil {
++		return nil, M.Socksaddr{}, err
++	}
++	packet := p.readOptions.NewBufferSize(len(data))
++	_, _ = packet.Write(data)
++	p.readOptions.PostReturn(packet)
++	return packet, p.destination, nil
++}
++
++func (p *xdialUDPTarget) WritePacket(packet *buf.Buffer, source M.Socksaddr) error {
++	if p.ctx.Err() != nil {
++		packet.Release()
++		return net.ErrClosed
++	}
++	return p.writer.WritePacket(packet, source)
++}
++
++func (p *xdialUDPTarget) Close() error {
++	p.end()
++	return nil
++}
++
++func (p *xdialUDPTarget) SetReadDeadline(t time.Time) error {
++	p.deadline.Set(t)
++	return nil
++}
++
++func (p *xdialUDPTarget) FrontHeadroom() int               { return N.CalculateFrontHeadroom(p.writer) }
++func (p *xdialUDPTarget) LocalAddr() net.Addr              { return p.local }
++func (p *xdialUDPTarget) SetDeadline(time.Time) error      { return os.ErrInvalid }
++func (p *xdialUDPTarget) SetWriteDeadline(time.Time) error { return os.ErrInvalid }

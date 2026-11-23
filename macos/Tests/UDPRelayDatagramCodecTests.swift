@@ -94,6 +94,26 @@ final class UDPRelayDatagramCodecTests: XCTestCase {
         XCTAssertEqual(decoded.endpoint, destination)
     }
 
+    func testFlowHostnameAndDomainRepliesStayWithInitialEndpoint() throws {
+        let codec = UDPRelayDatagramCodec(initialDestination: destination)
+        let other = Network.NWEndpoint.hostPort(
+            host: .ipv4(IPv4Address("192.0.2.9")!), port: 443
+        )
+        // Even if a later destination is read first, it cannot borrow the name.
+        let literal = try codec.encode(
+            payload: Data(), destination: other, remoteHostname: "example.com"
+        )
+        XCTAssertEqual(literal[3], 0x01)
+        let named = try codec.encode(
+            payload: Data(), destination: destination, remoteHostname: "example.com"
+        )
+        XCTAssertEqual(named[3], 0x03)
+        XCTAssertEqual(try codec.decode(packet: named)?.endpoint, destination)
+        XCTAssertEqual(try codec.decode(packet: literal)?.endpoint, other)
+        let unknown = Self.domainReply(name: "unknown.example", port: 443, payload: Data())
+        XCTAssertNil(try codec.decode(packet: unknown))
+    }
+
     func testDomainReplyWithoutAnyKnownDestinationIsDropped() throws {
         let codec = UDPRelayDatagramCodec()
 
