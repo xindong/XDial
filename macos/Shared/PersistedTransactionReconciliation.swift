@@ -78,4 +78,21 @@ enum PersistedTransactionReconciliation {
             }
         }
     }
+
+    /// The disconnect projection for a report still journaled as committed
+    /// when macOS reports the session gone.
+    ///
+    /// An explicit stop leaves a committed report for the Provider to finish,
+    /// but the Host's copy can still read committed when the disconnect
+    /// arrives. That transaction was withdrawn by the user, not lost under
+    /// XDial; finishing it as a session loss records a data-plane crash that
+    /// never happened (2026-11-23).
+    static func decideDisconnectedCommitted(
+        reportTransactionID: String,
+        explicitlyStoppedTransactionID: String?
+    ) -> PersistedTransactionDisposition {
+        reportTransactionID == explicitlyStoppedTransactionID
+            ? .finishWithdrawnTransaction
+            : .markProviderSessionLost
+    }
 }

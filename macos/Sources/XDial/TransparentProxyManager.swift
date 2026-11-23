@@ -94,6 +94,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         ((Result<Void, Error>) -> Void)?
     private var startAttempt: NetworkExtensionStartAttempt?
     private var startIntentID: UUID?
+    /// The transaction an explicit `stop()` withdrew; its disconnect is not
+    /// a session loss even if the journal still reads committed.
+    private var explicitlyStoppedTransactionID: String?
     private var currentTransactionID: String?
     /// Transactions this Host process began or adopted. Only transactions
     /// outside this set can be leftovers of an earlier Host process.
@@ -983,6 +986,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
         }
         if let transactionID = currentTransactionID {
+            explicitlyStoppedTransactionID = transactionID
             updateReport(transactionID: transactionID) { report in
                 guard report.state != .committed else { return }
                 report.setState(.rollingBack)
@@ -2575,12 +2579,24 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             if let report = ConnectionReportJournal.read(),
                report.state == .committed {
                 currentTransactionID = report.transactionID
-                finishInterruptedTransactionRecovery(
-                    transactionID: report.transactionID,
-                    error: .providerSessionLost,
-                    code: "provider-session-lost",
-                    taskID: "ingress:transparent-proxy"
-                )
+                switch PersistedTransactionReconciliation
+                    .decideDisconnectedCommitted(
+                        reportTransactionID: report.transactionID,
+                        explicitlyStoppedTransactionID:
+                            explicitlyStoppedTransactionID
+                    ) {
+                case .finishWithdrawnTransaction:
+                    finishWithdrawnTransaction(
+                        transactionID: report.transactionID
+                    )
+                default:
+                    finishInterruptedTransactionRecovery(
+                        transactionID: report.transactionID,
+                        error: .providerSessionLost,
+                        code: "provider-session-lost",
+                        taskID: "ingress:transparent-proxy"
+                    )
+                }
             }
             if let report = ConnectionReportJournal.read(),
                PersistedTransactionReconciliation.decide(

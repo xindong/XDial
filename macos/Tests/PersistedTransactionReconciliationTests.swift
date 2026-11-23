@@ -134,6 +134,36 @@ final class PersistedTransactionReconciliationTests: XCTestCase {
         }
     }
 
+    /// 2026-11-23: an explicit disconnect while the Host's journal still read
+    /// committed was recorded as "data plane exited unexpectedly".
+    func testExplicitlyStoppedCommittedTransactionIsWithdrawnNotLost() {
+        XCTAssertEqual(
+            PersistedTransactionReconciliation.decideDisconnectedCommitted(
+                reportTransactionID: "tx",
+                explicitlyStoppedTransactionID: "tx"
+            ),
+            .finishWithdrawnTransaction
+        )
+    }
+
+    func testCommittedTransactionLostWithoutExplicitStop() {
+        XCTAssertEqual(
+            PersistedTransactionReconciliation.decideDisconnectedCommitted(
+                reportTransactionID: "tx",
+                explicitlyStoppedTransactionID: nil
+            ),
+            .markProviderSessionLost
+        )
+        // A stop of an earlier transaction says nothing about this one.
+        XCTAssertEqual(
+            PersistedTransactionReconciliation.decideDisconnectedCommitted(
+                reportTransactionID: "tx",
+                explicitlyStoppedTransactionID: "earlier"
+            ),
+            .markProviderSessionLost
+        )
+    }
+
     private func decide(
         _ state: ConnectionTransactionState,
         _ ownership: TransactionOwnership,
