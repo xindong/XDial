@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,11 +25,19 @@ type udpRouteObservation struct {
 
 type udpRouteObserver struct {
 	routingProbeTracker
-	routes chan udpRouteObservation
+	routes   chan udpRouteObservation
+	holdPort uint16
+	release  <-chan struct{}
 }
 
 func (o *udpRouteObserver) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, _ adapter.Rule, outbound adapter.Outbound) N.PacketConn {
 	o.routes <- udpRouteObservation{ctx: ctx, metadata: metadata, outbound: outbound.Tag()}
+	if o.release != nil && metadata.Destination.Port == o.holdPort {
+		select {
+		case <-ctx.Done():
+		case <-o.release:
+		}
+	}
 	return conn
 }
 
@@ -137,4 +146,108 @@ func TestTransparentSOCKSUDPMultipleDestinations(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Hold one route before its outbound starts reading. Fill its queue, keep
+// another peer responsive, then evict and reopen the held destination.
+func TestTransparentSOCKSUDPTargetLimits(t *testing.T) {
+	const targetLimit = 64
+	peers := make([]*net.UDPConn, targetLimit+1)
+	for i := range peers {
+		peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer peer.Close()
+		peers[i] = peer
+	}
+
+	port := freeFlowCorrectionPort(t)
+	rt := newLoopbackFlowRuntimeWithConfig(t, fmt.Sprintf(`{
+		"log":{"disabled":true},
+		"inbounds":[{"type":"socks","tag":"flow","listen":"127.0.0.1","listen_port":%d,"xdial_flow_metadata":true}],
+		"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}
+	}`, port))
+	defer rt.Stop()
+	release := make(chan struct{})
+	resume := sync.OnceFunc(func() { close(release) })
+	defer resume()
+	observer := &udpRouteObserver{
+		routes:   make(chan udpRouteObservation, len(peers)+1),
+		holdPort: M.SocksaddrFromNet(peers[0].LocalAddr()).Port, release: release,
+	}
+	rt.box.Router().AppendTracker(observer)
+	client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), socks.Version5, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := client.ListenPacket(ctx, M.SocksaddrFromNet(peers[0].LocalAddr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+
+	send := func(index int, value byte) {
+		t.Helper()
+		if _, err := conn.WriteTo([]byte{value}, peers[index].LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nextRoute := func(index int) context.Context {
+		t.Helper()
+		select {
+		case route := <-observer.routes:
+			if route.metadata.Destination != M.SocksaddrFromNet(peers[index].LocalAddr()) {
+				t.Fatalf("route for %s, want peer %d", route.metadata.Destination, index)
+			}
+			return route.ctx
+		case <-ctx.Done():
+			t.Fatalf("peer %d did not get its own route", index)
+			return nil
+		}
+	}
+	roundTrip := func(index int, value byte) {
+		t.Helper()
+		server := peers[index]
+		if err := server.SetDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+		var data [64]byte
+		n, remote, err := server.ReadFrom(data[:])
+		if err != nil || n != 1 || data[0] != value {
+			t.Fatalf("peer %d received %v, want [%d]: %v", index, data[:n], value, err)
+		}
+		if _, err := server.WriteTo(data[:n], remote); err != nil {
+			t.Fatal(err)
+		}
+		n, responder, err := conn.ReadFrom(data[:])
+		if err != nil || n != 1 || data[0] != value || responder.String() != server.LocalAddr().String() {
+			t.Fatalf("reply for peer %d: %v from %v: %v", index, data[:n], responder, err)
+		}
+	}
+
+	send(0, 0)
+	held := nextRoute(0)
+	for i := 0; i < 32; i++ {
+		send(0, 0)
+	}
+	send(1, 1)
+	nextRoute(1)
+	roundTrip(1, 1)
+	for i := 2; i < len(peers); i++ {
+		send(i, byte(i))
+		nextRoute(i)
+	}
+	select {
+	case <-held.Done():
+	case <-ctx.Done():
+		t.Fatal("the least recently used route survived the 65th target")
+	}
+	resume()
+	send(0, 42)
+	nextRoute(0)
+	roundTrip(0, 42)
 }

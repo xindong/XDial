@@ -146,7 +146,7 @@
  	require.Equal(t, []byte{0, 128, 0, 0}, replyBuffer.Bytes())
 --- /dev/null
 +++ b/protocol/socks/xdial_udp.go
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,223 @@
 +package socks
 +
 +import (
@@ -312,6 +312,10 @@
 +	case <-p.deadline.Wait():
 +		return nil, os.ErrDeadlineExceeded
 +	case data := <-p.queue:
++		// Cancellation and a queued datagram can both be ready after eviction.
++		if p.ctx.Err() != nil {
++			return nil, net.ErrClosed
++		}
 +		return data, nil
 +	}
 +}
