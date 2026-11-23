@@ -43,7 +43,8 @@ enum PersistedTransactionReconciliation {
         report: ConnectionReport,
         ownership: TransactionOwnership,
         systemSession: SystemProxySessionState,
-        hostIntentActive: Bool
+        hostIntentActive: Bool,
+        explicitlyStoppedTransactionID: String?
     ) -> PersistedTransactionDisposition {
         switch report.state {
         case .failed, .cancelled:
@@ -53,7 +54,11 @@ enum PersistedTransactionReconciliation {
         case .committed:
             switch systemSession {
             case .absent, .inactive:
-                return .markProviderSessionLost
+                // The local journal can still show committed after a stop.
+                // Only a stop of this exact transaction explains its loss.
+                return report.transactionID == explicitlyStoppedTransactionID
+                    ? .finishWithdrawnTransaction
+                    : .markProviderSessionLost
             case .active:
                 return ownership == .inherited
                     ? .adoptCommittedSession
@@ -77,22 +82,5 @@ enum PersistedTransactionReconciliation {
                 return .finishWithdrawnTransaction
             }
         }
-    }
-
-    /// The disconnect projection for a report still journaled as committed
-    /// when macOS reports the session gone.
-    ///
-    /// An explicit stop leaves a committed report for the Provider to finish,
-    /// but the Host's copy can still read committed when the disconnect
-    /// arrives. That transaction was withdrawn by the user, not lost under
-    /// XDial; finishing it as a session loss records a data-plane crash that
-    /// never happened (2026-11-23).
-    static func decideDisconnectedCommitted(
-        reportTransactionID: String,
-        explicitlyStoppedTransactionID: String?
-    ) -> PersistedTransactionDisposition {
-        reportTransactionID == explicitlyStoppedTransactionID
-            ? .finishWithdrawnTransaction
-            : .markProviderSessionLost
     }
 }

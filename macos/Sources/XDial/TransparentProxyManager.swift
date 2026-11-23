@@ -985,8 +985,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 ))
             }
         }
+        explicitlyStoppedTransactionID = currentTransactionID
+            ?? ConnectionReportJournal.read()?.transactionID
         if let transactionID = currentTransactionID {
-            explicitlyStoppedTransactionID = transactionID
             updateReport(transactionID: transactionID) { report in
                 guard report.state != .committed else { return }
                 report.setState(.rollingBack)
@@ -2576,39 +2577,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             cancelStableConnectionReset()
             stopUnderlayMonitoring()
             finishSystemDisconnectRollbackIfNeeded()
-            if let report = ConnectionReportJournal.read(),
-               report.state == .committed {
-                currentTransactionID = report.transactionID
-                switch PersistedTransactionReconciliation
-                    .decideDisconnectedCommitted(
-                        reportTransactionID: report.transactionID,
-                        explicitlyStoppedTransactionID:
-                            explicitlyStoppedTransactionID
-                    ) {
-                case .finishWithdrawnTransaction:
-                    finishWithdrawnTransaction(
-                        transactionID: report.transactionID
-                    )
-                default:
-                    finishInterruptedTransactionRecovery(
-                        transactionID: report.transactionID,
-                        error: .providerSessionLost,
-                        code: "provider-session-lost",
-                        taskID: "ingress:transparent-proxy"
-                    )
-                }
-            }
-            if let report = ConnectionReportJournal.read(),
-               PersistedTransactionReconciliation.decide(
-                   report: report,
-                   ownership: ownership(of: report),
-                   systemSession: .inactive,
-                   hostIntentActive: hostIntentActive
-               ) == .finishWithdrawnTransaction {
-                finishWithdrawnTransaction(
-                    transactionID: report.transactionID
-                )
-            }
+            reconcilePersistedTransactionIfNeeded(
+                manager,
+                recoverInheritedTransaction: false
+            )
             if let transactionID = recoveringTransactionID {
                 recoveringTransactionID = nil
                 finishInterruptedTransactionRecovery(
@@ -3381,7 +3353,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     /// to the live state machine.
     @discardableResult
     private func reconcilePersistedTransactionIfNeeded(
-        _ manager: NETransparentProxyManager?
+        _ manager: NETransparentProxyManager?,
+        recoverInheritedTransaction: Bool = true
     ) -> Bool {
         guard let report = ConnectionReportJournal.read() else {
             return false
@@ -3390,7 +3363,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             report: report,
             ownership: ownership(of: report),
             systemSession: Self.systemSessionState(manager),
-            hostIntentActive: hostIntentActive
+            hostIntentActive: hostIntentActive,
+            explicitlyStoppedTransactionID: explicitlyStoppedTransactionID
         )
         switch disposition {
         case .none:
@@ -3408,11 +3382,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             )
             return false
         case .finishWithdrawnTransaction:
+            if report.state == .committed {
+                currentTransactionID = report.transactionID
+            }
             finishWithdrawnTransaction(
                 transactionID: report.transactionID
             )
             return false
         case let .recoverInterrupted(stopSystemSession):
+            guard recoverInheritedTransaction else { return false }
             currentTransactionID = report.transactionID
             guard stopSystemSession, let manager else {
                 finishInterruptedTransactionRecovery(

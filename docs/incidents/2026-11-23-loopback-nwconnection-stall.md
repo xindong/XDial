@@ -51,7 +51,7 @@
   进程级串行点。错误仍以 `NWError.posix` 抛出，诊断码与关流错误归类不变；立即取消用
   `SO_LINGER 0` 复位，与 `forceCancel()` 的拆除契约一致。LAN 共享监听器不在此列。
 - 宿主记录自己显式停止的事务；该事务断开时按撤回收尾为 `cancelled`
-  （`PersistedTransactionReconciliation.decideDisconnectedCommitted`）。
+  （`PersistedTransactionReconciliation.decide`）。状态通知与迟到的状态同步共用这个判断。
 
 ## 验证
 

@@ -40,27 +40,86 @@ final class RelaySocketTests: XCTestCase {
     }
 
     func testStreamRoundTripAndHalfClose() async throws {
-        let listener = try LoopbackTCPListener(echo: true)
+        let allowRead = DispatchSemaphore(value: 0)
+        let listener = try LoopbackTCPListener(echo: true) {
+            allowRead.wait()
+        }
         defer { listener.stop() }
         let socket = RelaySocket(
             kind: .stream,
             endpoint: .loopbackIPv4(port: listener.port)
         )
+        let deadline = DispatchWorkItem { socket.close(abortive: true) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: deadline)
+        defer {
+            deadline.cancel()
+            socket.close(abortive: false)
+            allowRead.signal()
+        }
         try await socket.connect()
-        let payload = Data((0..<100_000).map { UInt8($0 % 251) })
-        try await socket.send(payload)
-        try await socket.finishSending()
+        let payload = Data((0..<(8 * 1024 * 1024)).lazy.map { UInt8($0 % 251) })
+        async let sent: Void = sendAndHalfClose(payload, on: socket)
+        try await waitForPendingWrite(socket)
+        allowRead.signal()
         var echoed = Data()
         while true {
             let received = try await socket.receive(maximumLength: 64 * 1024)
-            XCTAssertNil(received.error)
+            if let error = received.error {
+                throw error
+            }
             echoed.append(received.data)
             if received.isComplete {
                 break
             }
         }
+        try await sent
         XCTAssertEqual(echoed, payload)
-        socket.close(abortive: false)
+    }
+
+    func testCloseFailsPendingSend() async throws {
+        let listener = try LoopbackTCPListener(echo: false)
+        defer { listener.stop() }
+        let socket = RelaySocket(
+            kind: .stream,
+            endpoint: .loopbackIPv4(port: listener.port)
+        )
+        defer { socket.close(abortive: true) }
+        try await socket.connect()
+        let completed = expectation(description: "pending send completes")
+        let pending = Task {
+            defer { completed.fulfill() }
+            try await socket.send(Data(repeating: 0x5a, count: 8 * 1024 * 1024))
+        }
+        defer { pending.cancel() }
+        try await waitForPendingWrite(socket)
+        socket.close(abortive: true)
+        await fulfillment(of: [completed], timeout: 5)
+        pending.cancel()
+        do {
+            try await pending.value
+            XCTFail("send survived close")
+        } catch let error as NWError {
+            XCTAssertEqual(error, .posix(.ECANCELED))
+        }
+    }
+
+    private func sendAndHalfClose(
+        _ payload: Data,
+        on socket: RelaySocket
+    ) async throws {
+        try await socket.send(payload)
+        try await socket.finishSending()
+    }
+
+    private func waitForPendingWrite(_ socket: RelaySocket) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !socket.hasPendingWrite {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("socket never waited for writability")
+                throw POSIXError(.ETIMEDOUT)
+            }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
     }
 
     func testConnectRefusedSurfacesPOSIXError() async throws {
@@ -203,7 +262,10 @@ private final class LoopbackTCPListener: @unchecked Sendable {
     private var accepted: [Int32] = []
     private var stopped = false
 
-    init(echo: Bool) throws {
+    init(
+        echo: Bool,
+        beforeEcho: (@Sendable () -> Void)? = nil
+    ) throws {
         fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(.EMFILE) }
         var reuse: Int32 = 1
@@ -218,6 +280,7 @@ private final class LoopbackTCPListener: @unchecked Sendable {
                 guard let self else { close(client); return }
                 if echo {
                     Thread.detachNewThread {
+                        beforeEcho?()
                         Self.echo(client)
                     }
                 } else {
@@ -273,6 +336,8 @@ private final class LoopbackTCPListener: @unchecked Sendable {
     }
 
     private static func echo(_ client: Int32) {
+        var enabled: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, 4)
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
         while true {
             let count = read(client, &buffer, buffer.count)

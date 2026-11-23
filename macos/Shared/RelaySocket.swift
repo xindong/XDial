@@ -87,6 +87,12 @@ final class RelaySocket: @unchecked Sendable {
     private var connectState: ConnectState = .idle
     private var closed = false
 
+    #if XDIAL_TESTING
+    var hasPendingWrite: Bool {
+        queue.sync { pendingWrite != nil }
+    }
+    #endif
+
     private enum ConnectState {
         case idle
         case connecting
@@ -402,12 +408,6 @@ final class RelaySocket: @unchecked Sendable {
                 let code = errno
                 if code == EINTR {
                     continue
-                }
-                if code == ENOBUFS {
-                    // The interface queue is full; UDP may drop, and waiting
-                    // on writability would spin because the socket stays
-                    // writable.
-                    return .success(())
                 }
                 if Self.wouldBlock(code) {
                     return nil

@@ -134,41 +134,42 @@ final class PersistedTransactionReconciliationTests: XCTestCase {
         }
     }
 
-    /// 2026-11-23: an explicit disconnect while the Host's journal still read
-    /// committed was recorded as "data plane exited unexpectedly".
-    func testExplicitlyStoppedCommittedTransactionIsWithdrawnNotLost() {
-        XCTAssertEqual(
-            PersistedTransactionReconciliation.decideDisconnectedCommitted(
-                reportTransactionID: "tx",
-                explicitlyStoppedTransactionID: "tx"
-            ),
-            .finishWithdrawnTransaction
-        )
-    }
-
-    func testCommittedTransactionLostWithoutExplicitStop() {
-        XCTAssertEqual(
-            PersistedTransactionReconciliation.decideDisconnectedCommitted(
-                reportTransactionID: "tx",
-                explicitlyStoppedTransactionID: nil
-            ),
-            .markProviderSessionLost
-        )
-        // A stop of an earlier transaction says nothing about this one.
-        XCTAssertEqual(
-            PersistedTransactionReconciliation.decideDisconnectedCommitted(
-                reportTransactionID: "tx",
-                explicitlyStoppedTransactionID: "earlier"
-            ),
-            .markProviderSessionLost
-        )
+    /// A late preferences sync can run before the disconnect notification
+    /// while the Provider's last mirrored report still reads committed.
+    func testLateSyncFinishesExplicitStopOnlyAfterSessionIsGone() {
+        for ownership in [TransactionOwnership.thisHost, .inherited] {
+            XCTAssertEqual(
+                decide(
+                    .committed, ownership, .active,
+                    explicitlyStoppedTransactionID: "tx"
+                ),
+                ownership == .inherited ? .adoptCommittedSession : .none
+            )
+            for session in [SystemProxySessionState.absent, .inactive] {
+                XCTAssertEqual(
+                    decide(
+                        .committed, ownership, session,
+                        explicitlyStoppedTransactionID: "tx"
+                    ),
+                    .finishWithdrawnTransaction
+                )
+                XCTAssertEqual(
+                    decide(
+                        .committed, ownership, session,
+                        explicitlyStoppedTransactionID: "earlier"
+                    ),
+                    .markProviderSessionLost
+                )
+            }
+        }
     }
 
     private func decide(
         _ state: ConnectionTransactionState,
         _ ownership: TransactionOwnership,
         _ session: SystemProxySessionState,
-        hostIntentActive: Bool = false
+        hostIntentActive: Bool = false,
+        explicitlyStoppedTransactionID: String? = nil
     ) -> PersistedTransactionDisposition {
         let plan = ConnectionPlan(
             schemaVersion: 3,
@@ -181,7 +182,8 @@ final class PersistedTransactionReconciliationTests: XCTestCase {
             report: report,
             ownership: ownership,
             systemSession: session,
-            hostIntentActive: hostIntentActive
+            hostIntentActive: hostIntentActive,
+            explicitlyStoppedTransactionID: explicitlyStoppedTransactionID
         )
     }
 }

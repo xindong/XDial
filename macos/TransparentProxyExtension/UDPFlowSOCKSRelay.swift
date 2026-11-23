@@ -182,6 +182,10 @@ enum UDPFlowSOCKSRelay {
                     }
                     do {
                         try await send(packet, to: datagramConnection)
+                    } catch NWError.posix(.ENOBUFS) {
+                        // An application datagram may be dropped when the
+                        // interface queue is full. Keep the association.
+                        continue
                     } catch {
                         // An upstream send failure invalidates the association,
                         // not the flow. Retire it and let the supervisor
@@ -396,6 +400,7 @@ enum UDPFlowSOCKSRelay {
             association.install(datagram: datagramConnection)
             try await datagramConnection.connect()
             if let boundInterface {
+                stage = "bound-association-marker"
                 // sing 的 SOCKS 服务端丢弃 UDP ASSOCIATE 的请求地址，只把首个
                 // 数据报的目标交给处理器。先发一个标记包携带绑定接口，sing-box
                 // 读取后丢弃它；之后的每个数据报才是 App 的真实流量。
