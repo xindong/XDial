@@ -17,8 +17,8 @@ export ANDROID_HOME=/path/to/Android/sdk
 python3 scripts/build-android.py --mode ci
 ```
 
-该命令重新构建双 ABI AAR，再构建并检查 Debug 和未签名 Release APK。单独构建使用
-`--mode debug` 或 `--mode unsigned`。Go 编译启用 trimpath，关闭路径相关的 VCS
+该命令构建双 ABI AAR、通用 Debug APK、分别供 arm64-v8a 和 x86_64 侧载的 Release APK，并生成未签名 Play App Bundle。Release 两个 APK 分别验签、检查 ABI 和对齐；签名测试模式对两个包逐一签名。AAB 位于 `android/app/build/outputs/bundle/release/app-release.aab`，由 CI 单独归档。单独构建使用
+`--mode debug` 或 `--mode unsigned`。Go 链接器剥离符号表与 DWARF，编译启用 trimpath，关闭路径相关的 VCS
 自动元数据；源码 revision、dirty 状态及工具版本写入旁侧 manifest。
 
 产物位于 `build/android/artifacts/` 的不可变子目录，包含 APK、`manifest.json`、
@@ -92,8 +92,11 @@ APK 被修改均拒绝交付。日志只指向构建日志，不输出 signer �
 错误证书拒绝与签名后篡改拒绝；退出后删除，既不发布也不当作 XDial 的长期身份：
 
 ```sh
-XDIAL_ANDROID_TEST_APK="$PWD/android/app/build/outputs/apk/release/app-release-unsigned.apk" \
-  python3 -m unittest discover -s scripts/tests -p 'test_android_build.py'
+for abi in arm64-v8a x86_64; do
+  XDIAL_ANDROID_TEST_ABI="$abi" \
+  XDIAL_ANDROID_TEST_APK="$PWD/android/app/build/outputs/apk/release/app-$abi-release-unsigned.apk" \
+    python3 -m unittest discover -s scripts/tests -p 'test_android_build.py' || exit 1
+done
 ```
 
 若候选 code 有覆盖，同时传 `XDIAL_ANDROID_TEST_CODE=N`；CI 自动读取同一 run 规则。

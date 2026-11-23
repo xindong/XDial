@@ -423,6 +423,7 @@ struct LinesTab: View {
     var groupsOnly = false
     @EnvironmentObject var state: AppState
     @State private var showAddSub = false
+    @State private var showCloudHostSetup = false
     @State private var draggedItem: SettingsReorderItem?
     @State private var searchText = ""
 
@@ -516,6 +517,12 @@ struct LinesTab: View {
                             type: "tailscale",
                             icon: "circle.grid.3x3.fill"
                         )
+                        Divider()
+                        Button {
+                            showCloudHostSetup = true
+                        } label: {
+                            Label(state.tr("我的云主机…", "My Server…"), systemImage: "server.rack")
+                        }
                     } label: {
                         HStack(spacing: 6) {
                             Label(state.tr("添加线路", "Add Line"), systemImage: "plus")
@@ -526,6 +533,9 @@ struct LinesTab: View {
                     }
                 }
             }
+        }
+        .sheet(isPresented: $showCloudHostSetup) {
+            MacCloudHostSetupSheet(state: state)
         }
     }
 
@@ -3007,5 +3017,40 @@ private struct NativeLinesView: View {
             }, copyLine: state.copyEditingLine,
             revealRequest: state.editorPosition.lineRevealRequest,
             revealHandled: state.editorPosition.finishLineReveal)
+    }
+}
+
+
+/// Hosts the shared "add my server" wizard and saves the verified line into the
+/// configuration being edited, through the encrypted profile library.
+struct MacCloudHostSetupSheet: View {
+    @ObservedObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model = CloudHostSetupModel()
+
+    var body: some View {
+        NavigationStack {
+            CloudHostSetupView(
+                model: model,
+                chinese: state.tr("zh", "en") == "zh",
+                onSave: { draft in
+                    let line = Line(cloudHost: draft)
+                    let previous = state.editingProfile
+                    state.editingProfile.lines.append(line)
+                    state.saveEditingProfile()
+                    guard state.profileLibraryLoaded, state.profilePersistenceError == nil else {
+                        state.editingProfile = previous
+                        state.profile = state.profileLibrary.snapshot()
+                        return false
+                    }
+                    state.editorPosition.expandedLineIDs.insert(line.id)
+                    return true
+                },
+                onClose: { dismiss() }
+            )
+        }
+        .frame(width: 560, height: 640)
+        .interactiveDismissDisabled(model.stage == .deploying)
+        .onDisappear { model.close() }
     }
 }

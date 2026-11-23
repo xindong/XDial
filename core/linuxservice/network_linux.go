@@ -16,7 +16,7 @@ import (
 
 // Events invalidate captured DNS/interface facts. No timer polls the network,
 // no interface is ranked, and no route decision is made here. The initial
-// service withdraws capture on change; reconnect is an explicit user intent.
+// service withdraws stale capture before resuming the existing user intent.
 func (s *Service) observeNetwork() error {
 	w, e := fsnotify.NewWatcher()
 	if e != nil {
@@ -80,12 +80,28 @@ func (s *Service) observeNetwork() error {
 				broken = true
 				s.networkFailed = true
 			}
-			if s.core != nil {
-				_, _, identity, e := s.networkFacts()
-				if broken || e != nil || identity != s.underlay || resolverIngressReady() != nil {
+			if broken {
+				if s.core != nil || s.profile != nil {
 					s.revision++
 					s.disconnect()
 				}
+			} else if s.core != nil {
+				_, _, identity, err := s.networkFacts()
+				switch {
+				case resolverIngressReady() != nil || (err != nil && !errors.Is(err, errNoUnderlay)):
+					s.revision++
+					s.disconnect()
+				case err != nil || identity != s.underlay:
+					s.revision++
+					if s.withdraw() != nil {
+						s.cancelRecovery()
+					} else {
+						s.controller.ObserveUnderlay("")
+						s.resume()
+					}
+				}
+			} else {
+				s.resume()
 			}
 			s.gate <- struct{}{}
 			if broken {

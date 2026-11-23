@@ -117,8 +117,33 @@ final class OnDemandReconnectTests: XCTestCase {
         ))
         XCTAssertFalse(OnDemandStartEnvelopeFailurePolicy.shouldClear(
             startedFromSecureEnvelope: true,
+            startupStage: "remote_address_lookup_unavailable"
+        ))
+        XCTAssertTrue(OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: true,
             startupStage: "remote_address_resolution_failed"
         ))
+        XCTAssertFalse(OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: true, startupStage: "engine_network_unavailable"
+        ))
+        XCTAssertTrue(OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: true, startupStage: "engine_failed"
+        ))
+    }
+
+    func testPreparationNetworkFailureKeepsSecureIntentButTerminalFailureRevokesIt() throws {
+        XCTAssertFalse(OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: true, startupStage: "preparation_network_unavailable"
+        ))
+        XCTAssertTrue(OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: true, startupStage: "preparation_failed"
+        ))
+        let envelope = OnDemandStartEnvelope(transport: "standalone",
+            parameters: ["preparation_profile": "{\"lines\":[]}"], configJSON: "{}")
+        let decoded = try JSONDecoder().decode(OnDemandStartEnvelope.self,
+            from: JSONEncoder().encode(envelope))
+        XCTAssertEqual(decoded.parameters["preparation_profile"], "{\"lines\":[]}")
+        XCTAssertTrue(decoded.isValid)
     }
 
     func testNonemptySystemOptionsDoNotMasqueradeAsManualStart() {

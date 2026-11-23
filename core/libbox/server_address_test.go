@@ -68,3 +68,19 @@ func TestServerHostnameRejectsIPv6BecauseControlPathIsTCP4(t *testing.T) {
 		t.Fatalf("error = %v, want IPv4-only error", err)
 	}
 }
+
+func TestStartupResultPreservesNetworkCauseWithoutExposingResolver(t *testing.T) {
+	for _, tc := range []struct {
+		cause error
+		retry bool
+	}{
+		{context.DeadlineExceeded, true},
+		{context.Canceled, false},
+		{&net.DNSError{IsNotFound: true, Name: "private.invalid"}, false},
+	} {
+		result := startupResult(resolveServerIPv4(context.Background(), &stubServerIPResolver{err: tc.cause}, "private.invalid"))
+		if result.Message != "server IPv4 lookup failed" || result.Retryable != tc.retry {
+			t.Fatalf("unexpected result %+v", result)
+		}
+	}
+}

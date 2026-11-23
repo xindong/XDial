@@ -5,6 +5,64 @@ import XCTest
 // MARK: - 共用规则
 
 final class ScenarioAutoSwitchRuleTests: XCTestCase {
+    func testSwitchNetworkSettingsSettleEveryTerminalPath() throws {
+        enum Failure: Error { case prepare, expired, invalidated, engine, commit }
+        for failure in [Failure.prepare, .expired, .invalidated, .engine, .commit] {
+            var routes = ["source"]
+            var settlements = 0
+            var operationRan = false
+            let result: Result<String, Error> = ScenarioSwitchNetworkTransaction.run {
+                routes = ["source", "candidate"]
+                // A system settings callback can fail after making partial changes.
+                if case .prepare = failure { throw failure }
+            } operation: {
+                operationRan = true
+                if case .expired = failure {
+                    _ = try ScenarioSwitchDeadline(requested: 1, now: 2).probeTimeoutMS(now: 2)
+                }
+                throw failure
+            } settle: { committed in
+                settlements += 1
+                routes = committed ? ["candidate"] : ["source"]
+            }
+            guard case .failure = result else { return XCTFail("failure committed") }
+            XCTAssertEqual(routes, ["source"])
+            XCTAssertEqual(settlements, 1)
+            if case .prepare = failure { XCTAssertFalse(operationRan) }
+        }
+        var routes = ["source"]
+        var settlements = 0
+        let result = ScenarioSwitchNetworkTransaction.run {
+            routes = ["source", "candidate"]
+        } operation: { "committed" } settle: { committed in
+            settlements += 1
+            routes = committed ? ["candidate"] : ["source"]
+        }
+        XCTAssertEqual(try result.get(), "committed")
+        XCTAssertEqual(routes, ["candidate"])
+        XCTAssertEqual(settlements, 1)
+    }
+
+    func testSwitchDeadlineIncludesQueueAndPreparationTime() throws {
+        let request = ScenarioSwitchDeadline(now: 100)
+        let provider = ScenarioSwitchDeadline(requested: request.uptime, now: 125)
+        XCTAssertEqual(provider.uptime, 160)
+        // Slow successful probes cannot extend the transaction indefinitely.
+        for index in 0..<6 {
+            XCTAssertEqual(try provider.probeTimeoutMS(now: 100 + Double(index) * 9), 10_000)
+        }
+        XCTAssertEqual(try provider.probeTimeoutMS(now: 158), 2_000)
+        XCTAssertThrowsError(try provider.probeTimeoutMS(now: 160))
+        XCTAssertThrowsError(try provider.probeTimeoutMS(now: 190))
+        XCTAssertLessThan(request.uptime - 100, ScenarioSwitchDeadline.replySeconds)
+    }
+
+    func testSwitchDeadlineCannotBeExtendedByPeer() {
+        XCTAssertEqual(ScenarioSwitchDeadline(requested: 500, now: 100).uptime, 160)
+        XCTAssertEqual(ScenarioSwitchDeadline(requested: 90, now: 100).uptime, 90)
+        XCTAssertEqual(ScenarioSwitchDeadline(requested: .nan, now: 100).uptime, 100)
+    }
+
     func testCatalogCompletionPreservesPolicyChangesAndCannotReviveClearedBuilds() {
         let enabled = ScenarioAutoPolicy(enabled: true, wifiRules: [], regionScenarios: [:], scenarioIDs: ["a"])
         var disabled = enabled

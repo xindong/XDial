@@ -172,6 +172,7 @@ targets:
       - ../apple/Home
       - ../apple/Sync
       - ../apple/Notifications
+      - ../apple/CloudHost
       - ../ios/XDialShared/DialGlyph.swift
       - Shared
       - path: AppIcon.icns
@@ -358,6 +359,7 @@ targets:
       - ../ios/XDialShared/DialGlyph.swift
       - Sources/XDial/AppDefaults.swift
       - Sources/XDial/DataUseNotice.swift
+      - ../apple/CloudHost/CloudHostDisclosure.swift
       - Sources/XDial/ApplicationLaunchPolicy.swift
       - Sources/XDial/AppVersion.swift
       - Sources/XDial/AppUpdateStager.swift
@@ -392,6 +394,7 @@ targets:
       - Sources/XDial/MenuBarRecoveryPolicy.swift
       - Sources/XDial/MenuBarRecoveryController.swift
       - Sources/XDial/MenuBarTrackingRepair.swift
+      - Sources/XDial/NetworkChangeNoticeBaseline.swift
       - Sources/XDial/NetworkInfo.swift
       - Sources/XDial/LineLatencyStore.swift
       - Sources/XDial/RotaryDial.swift

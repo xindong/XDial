@@ -115,14 +115,14 @@ def sign_apk(source, target, tools, env):
     return expected
 
 
-def inspect_apk(apk, mode, code, name, tools, env, expected_cert=None):
+def inspect_apk(apk, mode, code, name, tools, env, expected_cert=None, expected_abis=ABIS):
     with zipfile.ZipFile(apk) as archive:
         if archive.testzip() is not None:
             raise ValueError("APK ZIP integrity check failed")
         abis = sorted(item.split("/")[1] for item in archive.namelist()
                       if re.fullmatch(r"lib/[^/]+/libgojni.so", item))
-    if abis != ABIS:
-        raise ValueError("APK must include both arm64-v8a and x86_64 Go cores")
+    if abis != expected_abis:
+        raise ValueError(f"Expected APK native architectures {expected_abis}, found {abis}")
     badging = output([str(tools / "aapt"), "dump", "badging", str(apk)], env)
     package = re.search(r"package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging)
     app_id = "com.xd.xdial.android" + (".debug" if mode == "debug" else "")
@@ -155,7 +155,8 @@ def inspect_apk(apk, mode, code, name, tools, env, expected_cert=None):
 
 def package_artifact(apk, details, provenance):
     sha = digest(apk)
-    stem = "xdial-{}-{}-{}".format(details["version_code"], details["signing"], sha[:12])
+    abi = "-".join(details["abis"])
+    stem = f"xdial-{details['version_code']}-{details['signing']}-{abi}-{sha[:12]}"
     destination = BUILD / "artifacts" / stem
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="package-", dir=BUILD) as temporary:
@@ -202,22 +203,28 @@ def main():
     run_build(["bash", "scripts/check-public-content.sh"], build_env, BUILD / "package-gate.log")
     run_build(["bash", "scripts/build-android-core.sh"], build_env, BUILD / "package-core.log")
     modes = ["debug", "unsigned"] if args.mode == "ci" else [args.mode]
-    tasks = sorted(set("assembleDebug" if mode == "debug" else "assembleRelease" for mode in modes))
-    run_build([str(ROOT / "android/gradlew"), "-p", "android", "--no-daemon", *tasks], build_env, BUILD / "package-gradle.log")
+    gradle = [str(ROOT / "android/gradlew"), "-p", "android", "--no-daemon"]
+    if "debug" in modes:
+        run_build([*gradle, "assembleDebug"], build_env, BUILD / "package-debug.log")
+    if any(mode != "debug" for mode in modes):
+        run_build([*gradle, "-PxdialSplitApks=true", "assembleRelease", "bundleRelease"],
+                  build_env, BUILD / "package-release.log")
     provenance = {"source_revision": revision, "source_dirty": dirty, "aar_sha256": digest(BUILD / "Libbox.aar"),
                   "toolchain": {"go": go, "java": java, "gradle": "9.4.1", "agp": "9.2.1", "ndk": NDK,
                                 "build_tools": BUILD_TOOLS, "compile_sdk": 36}}
     for mode in modes:
-        source = ROOT / ("android/app/build/outputs/apk/debug/app-debug.apk" if mode == "debug" else
-                         "android/app/build/outputs/apk/release/app-release-unsigned.apk")
-        with tempfile.TemporaryDirectory(prefix="sign-", dir=BUILD) as temporary:
-            apk, expected = source, None
-            if mode == "signed":
-                apk = Path(temporary) / "app-signed.apk"
-                expected = sign_apk(source, apk, tools, env)
-            details = inspect_apk(apk, mode, code, contract["versionName"], tools, env, expected)
-            destination = package_artifact(apk, details, provenance)
-            print(destination.relative_to(ROOT))
+        outputs = ROOT / "android/app/build/outputs/apk"
+        variants = ([(outputs / "debug/app-debug.apk", ABIS)] if mode == "debug" else
+                    [(outputs / f"release/app-{abi}-release-unsigned.apk", [abi]) for abi in ABIS])
+        for source, abis in variants:
+            with tempfile.TemporaryDirectory(prefix="sign-", dir=BUILD) as temporary:
+                apk, expected = source, None
+                if mode == "signed":
+                    apk = Path(temporary) / "app-signed.apk"
+                    expected = sign_apk(source, apk, tools, env)
+                details = inspect_apk(apk, mode, code, contract["versionName"], tools, env, expected, abis)
+                destination = package_artifact(apk, details, provenance)
+                print(destination.relative_to(ROOT))
     return 0
 
 

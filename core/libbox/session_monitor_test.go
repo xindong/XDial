@@ -740,3 +740,27 @@ func TestStartFailureCallbackCanReadDiagnosticsAndStop(t *testing.T) {
 		t.Fatal("failure callback-triggered Stop did not stop engine")
 	}
 }
+
+func TestStartReportsRecoverableNetworkErrorsSeparatelyFromAuthentication(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code int
+	}{
+		{context.DeadlineExceeded, ErrCodeTransientNetwork},
+		{errors.New("tunnel negotiation failed 401 Cookie is not acceptable"), ErrCodeNetwork},
+	} {
+		cb := &sessionMonitorCallback{}
+		l := &Libbox{
+			cb:       cb,
+			vpn:      &startTestVPNClient{connectErr: tc.err},
+			platform: &xdPlatformInterface{},
+		}
+		if err := l.Start("https://connect.example.com", "user", "password", `{}`); err == nil {
+			t.Fatal("expected startup to fail")
+		}
+		events := cb.snapshot()
+		if len(events) != 1 || events[0].code != tc.code {
+			t.Errorf("startup failure %v: got events %+v, want code %d", tc.err, events, tc.code)
+		}
+	}
+}

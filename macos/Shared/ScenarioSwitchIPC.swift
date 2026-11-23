@@ -24,6 +24,12 @@ struct ProviderScenarioSwitchRejectedError: LocalizedError {
     let code: String
     let message: String?
 
+    /// Used only when the host prevented delivery or the Provider returned
+    /// a terminal cancellation, never from a cancel acknowledgement.
+    static var cancelled: Self {
+        Self(code: "switch-cancelled", message: "场景切换已取消")
+    }
+
     var errorDescription: String? {
         if let message, !message.isEmpty { return message }
         return "场景切换失败（\(code)）"
@@ -233,6 +239,11 @@ enum ProviderScenarioSwitchReconciliationResolution: Equatable {
 }
 
 enum ProviderScenarioSwitchReconciliation {
+    /// Source restoration proves non-commit, not why the candidate ended.
+    static func sourceRestoredFailureCode(timedOut: Bool) -> String {
+        timedOut ? "switch-timeout" : "switch-not-committed"
+    }
+
     static func resolve(
         sourceTransactionID: String,
         targetTransactionID: String,

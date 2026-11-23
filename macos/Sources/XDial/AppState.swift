@@ -46,6 +46,10 @@ final class AppState: ObservableObject {
     @Published private(set) var exitCountry: String?
     @Published private(set) var surveyingRegion = false
     private let scenarioPathMonitor = NWPathMonitor()
+    private var gatewayNoticeMonitor: NetworkGatewayNoticeMonitor?
+    private var networkNoticeTask: Task<Void, Never>?
+    private var networkNoticeBaseline = NetworkChangeNoticeBaseline()
+    private var noticePath: NetworkChangeNoticeBaseline.Path?
     private var scenarioSwitchGuard = ScenarioAutoSwitchGuard()
     private var currentScenarioNetwork: String {
         ScenarioNetworkIdentity.key(path: scenarioPathSignature, ssid: currentSSID)
@@ -57,7 +61,7 @@ final class AppState: ObservableObject {
         didSet {
             guard oldValue != automaticScenario else { return }
             xdialDefaults.set(automaticScenario, forKey: "xdial.auto-scenario")
-            supersedeAutomaticScenarioSwitchForNewEpoch()
+            supersedeAutomaticScenarioSwitchForNewEpoch(reason: .automaticModeChanged)
             cancelNetworkEpochQuietWindow()
             refreshRegionSelection()
             if automaticScenario { activateScenarioForCurrentSSIDIfNeeded(forceMatching: true) }
@@ -70,17 +74,48 @@ final class AppState: ObservableObject {
     }
 
     private func observeScenarioPath() {
-        guard !regionScenarioTargets.isEmpty else { return }
+        gatewayNoticeMonitor = NetworkGatewayNoticeMonitor { [weak self] in
+            self?.scheduleNetworkNotice()
+        }
         scenarioPathMonitor.pathUpdateHandler = { [weak self] path in
             let physical = path.availableInterfaces.filter { [.wifi, .wiredEthernet, .cellular].contains($0.type) }
             let signature = "\(path.status) \(physical.map(\.name).sorted()) \(path.gateways)"
+            let available = path.status == .satisfied
+            let noticePath = NetworkChangeNoticeBaseline.Path(
+                available: available, usesWiFi: available && path.usesInterfaceType(.wifi),
+                interfaces: [],
+                gateways: []
+            )
             Task { @MainActor [weak self] in
-                guard let self, self.scenarioPathSignature != signature else { return }
+                guard let self else { return }
+                if self.noticePath != noticePath {
+                    self.noticePath = noticePath
+                    self.scheduleNetworkNotice()
+                }
+                guard !self.regionScenarioTargets.isEmpty, self.scenarioPathSignature != signature else { return }
                 self.scenarioPathSignature = signature
                 self.refreshRegionSelection()
             }
         }
         scenarioPathMonitor.start(queue: DispatchQueue(label: "xdial.scenario-path"))
+    }
+
+    private func scheduleNetworkNotice() {
+        networkNoticeTask?.cancel()
+        guard noticePath != nil, !networkEpochPowerGate.defersNetworkWork else { return }
+        networkNoticeTask = Task { @MainActor [weak self] in
+            // CoreWLAN settles its SSID for one second after a link change.
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard !Task.isCancelled, let self, !networkEpochPowerGate.defersNetworkWork,
+                  var noticePath = self.noticePath else { return }
+            // Read the actual primary interfaces, not all available adapters of a type.
+            let facts = NetworkGatewayNoticeMonitor.currentFacts()
+            noticePath.interfaces = noticePath.available ? facts.interfaces : []
+            noticePath.gateways = noticePath.available ? facts.gateways : []
+            if networkNoticeBaseline.changed(path: noticePath, ssid: currentSSID) {
+                ConnectionNotice.network(available: noticePath.available).post()
+            }
+        }
     }
 
     private func refreshRegionSelection() {
@@ -826,6 +861,7 @@ final class AppState: ObservableObject {
                 self.runLaunchAutoConnectIfNeeded()
             }
         }
+        MacIntentHost.register(self)
         #if DEBUG
         Self.current = self
         Self.debugServer.start()
@@ -1197,6 +1233,7 @@ final class AppState: ObservableObject {
     private func handleWakeSignal(trigger: String) {
         if trigger == "workspace_did_wake" {
             networkEpochPowerGate.noteSystemDidWake()
+            scheduleNetworkNotice()
         }
         wakeStatusSyncGeneration += 1
         let generation = wakeStatusSyncGeneration
@@ -1529,11 +1566,14 @@ final class AppState: ObservableObject {
         connectionAwaitsDataUseNotice = false
     }
 
-    func connect() {
-        guard let activeScenario else { return }
+    func connect(onStartupFinished: ((Bool) -> Void)? = nil) {
+        guard let activeScenario else {
+            onStartupFinished?(false)
+            return
+        }
         connectionDesired.userRequestedConnection(scenarioID: activeScenario.id)
         cancelWakeReconnectTask()
-        beginConnection()
+        beginConnection(onStartupFinished: onStartupFinished)
     }
 
     @discardableResult
@@ -1559,8 +1599,14 @@ final class AppState: ObservableObject {
     }
 
     private func beginConnection(
-        automaticRetryTrigger: AutomaticReconnectTrigger? = nil
+        automaticRetryTrigger: AutomaticReconnectTrigger? = nil,
+        onStartupFinished: ((Bool) -> Void)? = nil
     ) {
+        var startupDeferred = false
+        var engineStarted = false
+        defer {
+            if !startupDeferred { onStartupFinished?(engineStarted) }
+        }
         guard dataUseNoticeAccepted else {
             // A connection the user asked for continues once the notice is confirmed.
             if automaticRetryTrigger == nil { connectionAwaitsDataUseNotice = true }
@@ -1581,10 +1627,17 @@ final class AppState: ObservableObject {
         // and route by Scenario. Connecting wins: stop it, wait until it has
         // exited, then begin with whatever the user still wants.
         if ProfileSourceLineFetcher.hasApplicationSession {
+            startupDeferred = true
             Task { [weak self] in
                 await ProfileSourceLineFetcher.cancelApplicationSessions()
-                guard let self, self.connectionDesired.wantsConnection else { return }
-                self.beginConnection(automaticRetryTrigger: automaticRetryTrigger)
+                guard let self, self.connectionDesired.wantsConnection else {
+                    onStartupFinished?(false)
+                    return
+                }
+                self.beginConnection(
+                    automaticRetryTrigger: automaticRetryTrigger,
+                    onStartupFinished: onStartupFinished
+                )
             }
             return
         }
@@ -1607,6 +1660,7 @@ final class AppState: ObservableObject {
         // GoEngine serializes account operations and releases the setup owner
         // once for the whole connection, including leases from an earlier UI.
         engine.start(profileJSON: profileJSON, automaticRetryTrigger: automaticRetryTrigger)
+        engineStarted = true
     }
 
     func retryAutomaticReconnectNow() {
@@ -1761,7 +1815,7 @@ final class AppState: ObservableObject {
                 || mode != .select),
            !scenarioSwitchCancellationRequested {
             scenarioSwitchCancellationRequested = true
-            engine.cancelScenarioSwitch()
+            engine.cancelScenarioSwitch(reason: .superseded)
         }
         driveScenarioSwitchIfPossible()
         return true
@@ -1950,11 +2004,15 @@ final class AppState: ObservableObject {
             // The Provider contract guarantees that a failed/aborted staged
             // switch leaves the source transaction committed. Do not persist
             // the target Scenario or replace the source report.
-            if cancellationWasRequested {
-                engine.lastError = nil
-            } else {
-                engine.lastError = error.localizedDescription
-            }
+            let failureCode =
+                (error as? ProviderScenarioSwitchRejectedError)?.code
+            let failureStatus = HostScenarioSwitchProjection.failureStatus(
+                code: failureCode ?? "",
+                cancellationRequested: cancellationWasRequested,
+                timedOut: false
+            )
+            engine.lastError = failureStatus == "cancelled"
+                ? nil : error.localizedDescription
             if !cancellationWasRequested,
                scenarioSwitchGeneration == generation,
                let automaticIntent = inFlight.automaticIntent,
@@ -2143,7 +2201,7 @@ final class AppState: ObservableObject {
         if scenarioSwitchInFlight != nil,
            !scenarioSwitchCancellationRequested {
             scenarioSwitchCancellationRequested = true
-            engine.cancelScenarioSwitch()
+            engine.cancelScenarioSwitch(reason: .userCancelled)
         }
     }
 
@@ -2151,7 +2209,7 @@ final class AppState: ObservableObject {
         invalidateAutomaticScenarioSwitchRetry()
         scenarioSwitchGeneration += 1
         if scenarioSwitchInFlight != nil {
-            engine.cancelScenarioSwitch()
+            engine.cancelScenarioSwitch(reason: .disconnected)
         }
         scenarioSwitchInFlight = nil
         scenarioSwitchCancellationRequested = false
@@ -2280,6 +2338,7 @@ final class AppState: ObservableObject {
         link: WiFiLinkState
     ) {
         currentSSID = ssid
+        scheduleNetworkNotice()
         currentWiFiLink = link
         wifiSSIDAccessState = accessState
         if initialSSIDAccessCheck.shouldPresent(
@@ -2303,7 +2362,7 @@ final class AppState: ObservableObject {
         // A new CoreWLAN transition starts before its stable SSID is readable.
         // Stop the old automatic candidate during the quiet window so it
         // cannot commit using proof from the network being left behind.
-        supersedeAutomaticScenarioSwitchForNewEpoch()
+        supersedeAutomaticScenarioSwitchForNewEpoch(reason: .wifiSettling)
         let currentDesiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
@@ -2330,7 +2389,7 @@ final class AppState: ObservableObject {
         }
         if let activeIntent = activeNetworkEpochScenarioSwitchIntent,
            (rawMatch ?? regionMatch()) != activeIntent.desiredScenarioID {
-            supersedeAutomaticScenarioSwitchForNewEpoch()
+            supersedeAutomaticScenarioSwitchForNewEpoch(reason: .scenarioMatchChanged)
         }
         let currentDesiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
@@ -2357,7 +2416,7 @@ final class AppState: ObservableObject {
             allowedMatch: matchedScenarioID
         )
         if rawMatch == nil, matchedScenarioID == nil, currentSSID != nil {
-            supersedeAutomaticScenarioSwitchForNewEpoch()
+            supersedeAutomaticScenarioSwitchForNewEpoch(reason: .unmatchedWiFi)
             networkEpochSwitchCoordinator.noteUnmatchedSSID()
         }
         guard let resolvedScenarioID = matchedScenarioID
@@ -2394,7 +2453,7 @@ final class AppState: ObservableObject {
         if forceNewEpoch
             || activeNetworkEpochScenarioSwitchIntent?
                 .underlayFingerprint != underlayFingerprint {
-            supersedeAutomaticScenarioSwitchForNewEpoch()
+            supersedeAutomaticScenarioSwitchForNewEpoch(reason: .underlayChanged)
         }
         let desiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
@@ -2426,7 +2485,7 @@ final class AppState: ObservableObject {
             completion(nil)
             return
         }
-        supersedeAutomaticScenarioSwitchForNewEpoch()
+        supersedeAutomaticScenarioSwitchForNewEpoch(reason: .recovery)
         let desiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
             ?? profile.activeScenarioID
@@ -2490,6 +2549,7 @@ final class AppState: ObservableObject {
                     .sampleCurrentForNetworkEpoch() {
                     ssidIsStable = self.currentSSID == wifi.ssid
                     self.currentSSID = wifi.ssid
+                    if !ssidIsStable { self.scheduleNetworkNotice() }
                     self.currentWiFiLink = wifi.link
                     self.wifiSSIDAccessState = wifi.accessState
                     let rawMatch = self.automaticScenario ? wifi.ssid.flatMap {
@@ -2498,7 +2558,7 @@ final class AppState: ObservableObject {
                     if let activeIntent = self
                         .activeNetworkEpochScenarioSwitchIntent,
                        (rawMatch ?? self.regionMatch()) != activeIntent.desiredScenarioID {
-                        self.supersedeAutomaticScenarioSwitchForNewEpoch()
+                        self.supersedeAutomaticScenarioSwitchForNewEpoch(reason: .scenarioMatchChanged)
                     }
                     let currentDesiredScenarioID =
                         self.scenarioSwitchTargetID
@@ -2518,7 +2578,7 @@ final class AppState: ObservableObject {
                         allowedMatch: matchedScenarioID
                     )
                     if rawMatch == nil, matchedScenarioID == nil, wifi.ssid != nil {
-                        self.supersedeAutomaticScenarioSwitchForNewEpoch()
+                        self.supersedeAutomaticScenarioSwitchForNewEpoch(reason: .unmatchedWiFi)
                         self.networkEpochSwitchCoordinator
                             .noteUnmatchedSSID()
                     }
@@ -2771,7 +2831,7 @@ final class AppState: ObservableObject {
         if scenarioSwitchInFlight?.automaticIntent == intent,
            !scenarioSwitchCancellationRequested {
             scenarioSwitchCancellationRequested = true
-            engine.cancelScenarioSwitch()
+            engine.cancelScenarioSwitch(reason: .sleep)
         }
     }
 
@@ -2802,7 +2862,7 @@ final class AppState: ObservableObject {
         return true
     }
 
-    private func supersedeAutomaticScenarioSwitchForNewEpoch() {
+    private func supersedeAutomaticScenarioSwitchForNewEpoch(reason: ScenarioSwitchCancellationReason) {
         guard let intent = activeNetworkEpochScenarioSwitchIntent else {
             return
         }
@@ -2825,7 +2885,7 @@ final class AppState: ObservableObject {
         if scenarioSwitchInFlight?.automaticIntent == intent,
            !scenarioSwitchCancellationRequested {
             scenarioSwitchCancellationRequested = true
-            engine.cancelScenarioSwitch()
+            engine.cancelScenarioSwitch(reason: reason)
         }
     }
 
@@ -2865,10 +2925,13 @@ final class AppState: ObservableObject {
         guard profile.scenarios.contains(where: { $0.id == id }) else {
             return false
         }
+        let changed = profile.activeScenarioID != id
         profile.activeScenarioID = id
         if blockedConnectionScenarioID != id { blockedConnectionScenarioID = nil }
         save()
-        return profilePersistenceError == nil
+        guard profilePersistenceError == nil else { return false }
+        if changed { ConnectionNotice.scenario.post(scenarioName: activeScenario?.name ?? "") }
+        return true
     }
 
     /// 兼容既有 UI / Debug intent；实际执行统一进入完整安装事务。

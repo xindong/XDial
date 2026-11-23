@@ -57,6 +57,18 @@ iPhone、Apple TV 和 Mac 包里必须是 `xdial-mobile-seed` 格式；只有旧
   ```
 
   旧条目不要删，下次再改时把当时的内容加进列表。
+- `scenario_history` 可选：预置改了已有场景的路由（默认出口、规则绑定或它们的顺序）时，在这里按场景 ID
+  列出之前各版发过的路由：`default_line_id` 加按顺序的 `bindings`（每条只有 `rule_set_id` 和 `line_id`），
+  引用的线路和规则必须在当前预置里。顺序要和当时一致，第一条命中的规则决定出口。例如在「在国外」最前面加一条直连规则：
+
+  ```json
+  "scenario_history": {
+    "overseas": [{ "default_line_id": "direct",
+                   "bindings": [{ "rule_set_id": "intranet", "line_id": "vpn" }] }]
+  }
+  ```
+
+  同样不要删旧条目。名称、图标和 Wi-Fi 触发不在比较范围内，用户改过它们不妨碍换新路由，也不会被覆盖。
 
 App 怎么用它：
 
@@ -65,7 +77,11 @@ App 怎么用它：
   改过的和当前选中的场景都不动。预置线路如果和已有线路是同一类型、同一个服务器，
   就沿用已有的那条。每个 `revision` 只加一次，用户之后删掉的不会再回来。
 - `rule_set_history` 里列出的规则：用户的这条规则仍等于之前某一版发的内容（没改过）时换成新内容；
-  改过的保留，并在日志记 `seed: kept the user's edits to rule <ID>`。iPhone、Apple TV 和 Mac 规则相同。
+  改过的保留，并在日志记 `seed: kept the user's edits to rule <ID>`。
+- `scenario_history` 里列出的场景：用户的这个场景的路由仍等于之前某一版发的（App 自己维护的连接验收绑定不算）时，
+  换成预置的新默认出口和规则绑定；用户换过出口、调过规则或顺序、用了订阅出口或规则条件的保留，
+  并在日志记 `seed: kept the user's edits to scenario <ID>`。新增规则和场景照旧只补一次。
+  iPhone、Apple TV 和 Mac 规则相同。
 
 ## 随包规则
 

@@ -1,6 +1,9 @@
 package libbox
 
-import "github.com/kafeifei/xdial/core/mobile"
+import (
+	"github.com/kafeifei/xdial/core/mobile"
+	"github.com/kafeifei/xdial/core/recovery"
+)
 
 // PickScenario exposes the platform-independent mobile policy to gomobile.
 func PickScenario(scenariosJSON, regionsJSON, ssid, country string) (string, error) {
@@ -49,10 +52,12 @@ func (c *ScenarioController) Commit(token, nowMS int64) error {
 func (c *ScenarioController) Abort(token int64) error { return c.controller.Abort(token) }
 
 // ConnectionController shares intent and recovery policy across mobile hosts.
-type ConnectionController struct{ controller *mobile.ConnectionController }
+type ConnectionController struct {
+	controller *recovery.ConnectionController
+}
 
 func NewConnectionController() *ConnectionController {
-	return &ConnectionController{mobile.NewConnectionController()}
+	return &ConnectionController{recovery.NewConnectionController()}
 }
 func (c *ConnectionController) RequestConnection(enabled bool) {
 	c.controller.RequestConnection(enabled)
@@ -60,6 +65,7 @@ func (c *ConnectionController) RequestConnection(enabled bool) {
 func (c *ConnectionController) ObserveUnderlay(identity string) {
 	c.controller.ObserveUnderlay(identity)
 }
+func (c *ConnectionController) NetworkBecameReachable()       { c.controller.NetworkBecameReachable() }
 func (c *ConnectionController) NextAttempt(nowMS int64) int64 { return c.controller.NextAttempt(nowMS) }
 func (c *ConnectionController) CompleteAttempt(epoch int64, success, retryable bool, nowMS int64) {
 	c.controller.CompleteAttempt(epoch, success, retryable, nowMS)
@@ -85,3 +91,7 @@ func ScenarioEditor(profileJSON, scenarioID string) (string, error) {
 func EditScenario(profileJSON, commandJSON string) (string, error) {
 	return mobile.EditScenario(profileJSON, commandJSON)
 }
+
+const ConnectionRetryLimit = recovery.RetryLimit
+
+func ConnectionRetrySeconds(attemptsUsed int) int { return recovery.RetrySeconds(attemptsUsed) }

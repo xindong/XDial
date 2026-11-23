@@ -600,4 +600,89 @@ final class ProfileLibraryMigrationTests: XCTestCase {
         XCTAssertEqual(updated.snapshot().ruleSets.first { $0.id == scopedIntranet }?.domains, ["example.com"])
         XCTAssertEqual(updated.snapshot().ruleSets.first { $0.id == "intranet" }, userRule)
     }
+
+    /// The next revision puts a new direct rule first in "在国外" and records the routing it shipped before.
+    private func reroutedPhoneSeed() throws -> (Profile, [String: [ShippedScenarioRouting]]) {
+        var seed = try phoneSeed()
+        let overseas = try XCTUnwrap(seed.scenarios.firstIndex { $0.id == "overseas" })
+        let shipped = try XCTUnwrap(ShippedScenarioRouting(seed.scenarios[overseas]))
+        seed.ruleSets.append(RuleSet(id: "product", name: "产品", type: "manual", domains: ["product.example"]))
+        seed.scenarios[overseas].bindings.insert(RuleBinding(ruleSetID: "product", lineID: "direct"), at: 0)
+        return (seed, ["overseas": [shipped]])
+    }
+
+    func testReroutedScenarioFollowsThePresetOnlyWhileUntouched() throws {
+        let created = try XCTUnwrap(ProfileLibraryMigration.seedLibrary(SeedProfile(name: "心动", text: "v2"), id: "seed") { _, _ in
+            try self.phoneSeed()
+        })
+        var renamed = created
+        let index = try XCTUnwrap(renamed.scenarios.firstIndex { $0.id == "overseas" })
+        renamed.scenarios[index].name = "出差"
+        renamed.scenarios[index].iconOverride = "travel"
+        renamed = try renamed.validated()
+        let (current, history) = try reroutedPhoneSeed()
+        let updated = try ProfileLibraryMigration.addingMobileSeed(current, named: "心动", id: "seed", to: renamed,
+                                                                   scenarioHistory: history)
+        let overseas = try XCTUnwrap(updated.scenarios.first { $0.id == "overseas" })
+        XCTAssertEqual(overseas.bindings.map(\.ruleSetID), ["product", "lan", "intranet", "cn"])
+        XCTAssertEqual(overseas.name, "出差")
+        XCTAssertEqual(overseas.iconOverride, "travel")
+        XCTAssertEqual(updated.scenarios.first { $0.id == "domestic" }?.bindings.map(\.ruleSetID), ["intranet", "lan", "cn"])
+        XCTAssertEqual(try ProfileLibraryMigration.addingMobileSeed(current, named: "心动", id: "seed", to: updated,
+                                                                    scenarioHistory: history).snapshot(),
+                       updated.snapshot(), "applying the same revision again changes nothing")
+        // Without the history an existing Scenario keeps its routing, as before.
+        let unchanged = try ProfileLibraryMigration.addingMobileSeed(current, named: "心动", id: "seed", to: renamed)
+        XCTAssertEqual(unchanged.scenarios.first { $0.id == "overseas" }?.bindings.map(\.ruleSetID), ["lan", "intranet", "cn"])
+
+        var edited = created
+        edited.scenarios[index].defaultLineID = "vpn"
+        edited = try edited.validated()
+        let kept = try ProfileLibraryMigration.addingMobileSeed(current, named: "心动", id: "seed", to: edited,
+                                                                scenarioHistory: history)
+        let mine = try XCTUnwrap(kept.scenarios.first { $0.id == "overseas" })
+        XCTAssertEqual(mine.defaultLineID, "vpn")
+        XCTAssertEqual(mine.bindings.map(\.ruleSetID), ["lan", "intranet", "cn"])
+    }
+
+    func testScenarioHistoryFollowsTheImportedAndScopedIDs() throws {
+        let directory = try temporaryHome()
+        let history = #""scenario_history":{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"intranet","line_id":"vpn"}]}]}"#
+        let text = #"{"format":"xdial-mobile-seed","schema_version":1,"revision":3,"#.appending(history)
+            + #","profile":{"lines":[{"id":"direct","type":"direct"},{"id":"vpn","type":"vpn"}],"rule_sets":[{"id":"intranet","type":"manual"}],"scenarios":[{"id":"office"},{"id":"overseas"}]}}"#
+        try Data(text.utf8).write(to: directory.appendingPathComponent("心动.json"))
+        let source = try XCTUnwrap(SeedProfile.load(directory: directory))
+        var imported = Profile()
+        imported.lines = [Line(id: "line-a", name: "直连", type: "direct"), Line(id: "line-b", name: "VPN", type: "vpn")]
+        imported.ruleSets = [RuleSet(id: "rule-a", name: "公司内网", type: "manual")]
+        imported.scenarios = [Scenario(id: "scene-a", name: "在公司"), Scenario(id: "scene-b", name: "在国外")]
+        XCTAssertEqual(source.scenarioHistory(in: imported), ["scene-b": [ShippedScenarioRouting(
+            defaultLineID: "line-a", bindings: [.init(ruleSetID: "rule-a", lineID: "line-b")])]])
+        for bad in [#""scenario_history":{"gone":[{"default_line_id":"direct"}]}"#,
+                    #""scenario_history":{"overseas":[{"default_line_id":"gone"}]}"#,
+                    #""scenario_history":{"overseas":[{"default_line_id":"direct","name":"x"}]}"#,
+                    #""scenario_history":{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"gone","line_id":"vpn"}]}]}"#,
+                    #""scenario_history":{"overseas":"x"}"#] {
+            try Data(text.replacingOccurrences(of: history, with: bad).utf8).write(to: directory.appendingPathComponent("心动.json"))
+            XCTAssertThrowsError(try SeedProfile.load(directory: directory), bad)
+        }
+
+        // Beside the user's own Profile the seed's IDs are scoped; the history follows them.
+        var userLibrary = try ProfileLibraryMigration.starterLibrary()
+        userLibrary.profiles[0].profile.ruleSets.append(RuleSet(id: "intranet", name: "My rule", type: "manual"))
+        userLibrary.scenarios.append(Scenario(id: "overseas", name: "Mine", defaultLineID: "direct"))
+        userLibrary.activeScenarioID = "overseas"
+        userLibrary = try userLibrary.validated()
+        let joined = try ProfileLibraryMigration.merging(try phoneSeed(), named: "心动", id: "seed", into: userLibrary).validated()
+        let mapping = try XCTUnwrap(joined.profiles.first { $0.id == "seed" }?.resourceIDs)
+        let scopedOverseas = try XCTUnwrap(mapping["overseas"])
+        XCTAssertNotEqual(scopedOverseas, "overseas", "the collision must scope the preset Scenario")
+        let (current, routing) = try reroutedPhoneSeed()
+        let updated = try ProfileLibraryMigration.addingMobileSeed(current, named: "心动", id: "seed", to: joined,
+                                                                   scenarioHistory: routing)
+        let scoped = try XCTUnwrap(updated.scenarios.first { $0.id == scopedOverseas })
+        XCTAssertEqual(scoped.bindings.map(\.ruleSetID),
+                       ["product"] + ["lan", "intranet", "cn"].map { mapping[$0] ?? $0 })
+        XCTAssertEqual(updated.scenarios.first { $0.id == "overseas" }?.bindings, [])
+    }
 }

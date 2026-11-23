@@ -5,6 +5,50 @@ import CryptoKit
 // App 与 VPN 扩展共用的自动选场景规则、扩展上报的场景状态，以及共享 Keychain 里的场景目录。
 // 只依赖 Foundation / Security：小组件也编译这个目录。
 
+/// One monotonic deadline travels from the App through queueing, preparation and probes.
+/// Leave 30 seconds before the App watchdog for abort/restore and the reply.
+struct ScenarioSwitchDeadline: Sendable {
+    static let requestKey = "scenario_deadline_uptime"
+    static let operationSeconds: TimeInterval = 60
+    static let replySeconds: TimeInterval = 90
+    let uptime: TimeInterval
+
+    init(requested: TimeInterval? = nil, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        let local = now + Self.operationSeconds
+        uptime = requested.map { $0.isFinite ? min($0, local) : now } ?? local
+    }
+
+    func probeTimeoutMS(now: TimeInterval = ProcessInfo.processInfo.systemUptime) throws -> Int {
+        let remaining = min(10, uptime - now)
+        guard remaining >= 0.001 else {
+            throw NSError(domain: "XDial.ScenarioSwitch", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "场景切换超时，未提交新场景"])
+        }
+        return Int(remaining * 1_000)
+    }
+}
+
+/// The caller owns network settings for the whole switch, including preparation errors.
+/// Every exit settles once; only a committed operation may retain candidate settings.
+enum ScenarioSwitchNetworkTransaction {
+    static func run<Value>(
+        prepare: () throws -> Void,
+        operation: () throws -> Value,
+        settle: (Bool) -> Void
+    ) -> Result<Value, Error> {
+        var committed = false
+        defer { settle(committed) }
+        do {
+            try prepare()
+            let value = try operation()
+            committed = true
+            return .success(value)
+        } catch {
+            return .failure(error)
+        }
+    }
+}
+
 // MARK: - 判断规则
 
 /// Main actor owned catalog build state. Policy changes survive the first build;
@@ -220,6 +264,9 @@ struct TunnelScenarioState: Codable, Equatable, Sendable {
     var runningScenarioID: String?
     /// 最近一次判断的结论。没判断出来时保留上一次。
     var lastPick: ScenarioAutoPick?
+    var currentPick: ScenarioAutoPick? {
+        lastSurvey?.picked == false ? nil : lastPick
+    }
     var lastSurvey: ScenarioSurveyRecord?
     /// 判断出该换、却因为十分钟内刚换过而没有自动换的场景。App 显示为建议。
     var suggestedScenarioID: String?

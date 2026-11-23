@@ -5,7 +5,8 @@ struct OnDemandStartEnvelope: Codable, Equatable, Sendable {
     static let currentFormat = "xdial-on-demand-start"
     // v3: acceptance_plan 同时记录所有生成的 Tailscale endpoint readiness；
     // 公网探针只记录适用的显式出口。拒绝旧计划，避免按需恢复漏验 endpoint。
-    static let currentSchemaVersion = 3
+    // v4: a deferred cold-cache preparation profile must never be read as a ready config by older builds.
+    static let currentSchemaVersion = 4
     static let maxConfigBytes = 2 * 1024 * 1024
 
     let format: String
@@ -40,6 +41,7 @@ struct OnDemandStartEnvelope: Codable, Equatable, Sendable {
             && !transport.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !configJSON.isEmpty
             && configJSON.utf8.count <= Self.maxConfigBytes
+            && (parameters["preparation_profile"]?.utf8.count ?? 0) <= Self.maxConfigBytes
     }
 }
 
@@ -48,9 +50,16 @@ enum OnDemandStartEnvelopeFailurePolicy {
         startedFromSecureEnvelope: Bool,
         startupStage: String
     ) -> Bool {
-        // No change to credentials or configuration can repair a missing underlay or DNS.
-        startedFromSecureEnvelope && startupStage != "underlay_interface_failed"
-            && startupStage != "remote_address_resolution_failed"
+        startedFromSecureEnvelope && !isTransient(stage: startupStage)
+    }
+
+    static func isTransient(stage: String?) -> Bool {
+        switch stage {
+        case "preparation_network_unavailable", "underlay_interface_failed", "engine_network_unavailable", "remote_address_lookup_unavailable":
+            return true
+        default:
+            return false
+        }
     }
 }
 

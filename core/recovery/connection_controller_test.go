@@ -1,4 +1,4 @@
-package mobile
+package recovery
 
 import (
 	"encoding/json"
@@ -47,20 +47,20 @@ func TestConnectionBoundedBackoffAndFatalFailure(t *testing.T) {
 	c.ObserveUnderlay("a")
 	c.RequestConnection(true)
 	now := int64(0)
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt <= RetryLimit; attempt++ {
 		epoch := c.NextAttempt(now)
 		if epoch == 0 {
 			t.Fatal(c.Snapshot())
 		}
 		c.CompleteAttempt(epoch, false, true, now)
 		s := connectionSnapshot(c)
-		if attempt == 4 {
-			if s.Phase != "failed" {
+		if attempt == RetryLimit {
+			if s.Phase != "waiting_network" || !s.Desired {
 				t.Fatal(s)
 			}
 			break
 		}
-		if s.RetryAt-now != int64(1000<<attempt) || c.NextAttempt(s.RetryAt-1) != 0 {
+		if s.RetryAt-now != int64(RetrySeconds(attempt))*1000 || c.NextAttempt(s.RetryAt-1) != 0 {
 			t.Fatal("unbounded or early retry", s)
 		}
 		now = s.RetryAt
@@ -91,16 +91,39 @@ func TestRetryAttemptRejectsPreviousCoreCallback(t *testing.T) {
 	c.RequestConnection(true)
 	first := c.NextAttempt(0)
 	c.CompleteAttempt(first, false, true, 0)
-	second := c.NextAttempt(1000)
+	second := c.NextAttempt(2000)
 	if second == first || second == 0 {
 		t.Fatal("retry needs a distinct callback epoch")
 	}
-	c.CompleteAttempt(first, false, false, 1000)
+	c.CompleteAttempt(first, false, false, 2000)
 	if connectionSnapshot(c).Phase != "connecting" {
 		t.Fatal("old core killed retry")
 	}
-	c.CompleteAttempt(second, true, false, 1000)
+	c.CompleteAttempt(second, true, false, 2000)
 	if connectionSnapshot(c).Phase != "connected" {
 		t.Fatal(c.Snapshot())
+	}
+}
+
+func TestReachabilityOnSameNetwork(t *testing.T) {
+	c := NewConnectionController()
+	c.RequestConnection(true)
+	c.ObserveUnderlay("wifi")
+	first := c.NextAttempt(0)
+	c.CompleteAttempt(first, false, true, 0)
+	c.NetworkBecameReachable()
+	retry := c.NextAttempt(1)
+	if retry == 0 {
+		t.Fatal("available path did not resume retry")
+	}
+	c.NetworkBecameReachable()
+	c.CompleteAttempt(retry, true, false, 2)
+	if connectionSnapshot(c).Phase != "connected" {
+		t.Fatal("reachability replaced live attempt")
+	}
+	c.RequestConnection(false)
+	c.NetworkBecameReachable()
+	if c.NextAttempt(3) != 0 {
+		t.Fatal("manual disconnect was undone")
 	}
 }

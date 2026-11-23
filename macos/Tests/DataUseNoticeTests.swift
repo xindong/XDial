@@ -59,4 +59,14 @@ final class DataUseNoticeTests: XCTestCase {
             XCTAssertTrue(text.contains(isChinese ? "以公司的规定为准" : "governed by your company's policies"))
         }
     }
+
+    func testNoticeCoversMyServer() {
+        for isChinese in [true, false] {
+            let text = MacDataUseNotice.sections(isChinese: isChinese, companyPreset: false)
+                .flatMap(\.points).joined(separator: "\n")
+            for needle in ["speed.cloudflare.com", "deb.sagernet.org", "10 MB"] {
+                XCTAssertTrue(text.contains(needle), needle)
+            }
+        }
+    }
 }

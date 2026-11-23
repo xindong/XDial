@@ -267,3 +267,61 @@ func TestRuleHistoryRejectsInvalidJSONShapes(t *testing.T) {
 		mustLoad(t, data)
 	}
 }
+
+const overseasHistory = `"scenario_history":{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"intranet","line_id":"vpn"}]}]},`
+
+func TestScenarioHistoryIsValidatedAndCompared(t *testing.T) {
+	withHistory := strings.Replace(authority, `"revision":2,`, `"revision":2,`+overseasHistory, 1)
+	seed := mustLoad(t, withHistory)
+	if len(seed.ScenarioHistory) != 1 {
+		t.Fatalf("history not loaded: %v", seed.ScenarioHistory)
+	}
+	// The history speaks in the imported IDs, like the rest of the seed.
+	for id, versions := range seed.ScenarioHistory {
+		if id != seed.Profile.Scenarios[1].ID || versions[0].DefaultLineID != seed.Profile.Lines[0].ID ||
+			versions[0].Bindings[0] != (RoutingBinding{RuleSetID: seed.Profile.RuleSets[0].ID, LineID: seed.Profile.Lines[1].ID}) {
+			t.Fatalf("history not in imported IDs: %s %+v", id, versions)
+		}
+	}
+	want := Fingerprint(seed, nil)
+	if d := Diff(want, Fingerprint(mustLoad(t, authority), nil), nil); len(d) == 0 {
+		t.Fatal("a package that drops the history must differ")
+	}
+	if d := Diff(want, Fingerprint(mustLoad(t, authority), nil), []string{"scenario_history"}); len(d) != 0 {
+		t.Fatalf("a declared capability limit must be tolerated: %v", d)
+	}
+	// Binding order decides routing, so it counts.
+	reordered := strings.Replace(withHistory, `"bindings":[{"rule_set_id":"intranet","line_id":"vpn"}]}]}`,
+		`"bindings":[{"rule_set_id":"cn","line_id":"vpn"},{"rule_set_id":"intranet","line_id":"vpn"}]}]}`, 1)
+	other := strings.Replace(reordered, `{"rule_set_id":"cn","line_id":"vpn"},{"rule_set_id":"intranet","line_id":"vpn"}`,
+		`{"rule_set_id":"intranet","line_id":"vpn"},{"rule_set_id":"cn","line_id":"vpn"}`, 1)
+	if d := Diff(Fingerprint(mustLoad(t, reordered), nil), Fingerprint(mustLoad(t, other), nil), nil); len(d) == 0 {
+		t.Fatal("binding order must count")
+	}
+}
+
+func TestScenarioHistoryRejectsWhatTheAppsReject(t *testing.T) {
+	for _, history := range []string{
+		`null`, `[]`, `{"overseas":null}`, `{"overseas":{}}`, `{"overseas":[null]}`, `{"overseas":[[]]}`,
+		`{"gone":[{"default_line_id":"direct"}]}`,
+		`{"overseas":[{}]}`, `{"overseas":[{"default_line_id":""}]}`, `{"overseas":[{"default_line_id":"gone"}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":null}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":[null]}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"intranet"}]}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"gone","line_id":"vpn"}]}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"intranet","line_id":"gone"}]}]}`,
+		`{"overseas":[{"default_line_id":"direct","bindings":[{"rule_set_id":"intranet","line_id":"vpn","condition_ids":[]}]}]}`,
+		`{"overseas":[{"default_line_id":"direct","name":"在国外"}]}`,
+	} {
+		t.Run(history, func(t *testing.T) {
+			data := strings.Replace(authority, `"revision":2,`, `"revision":2,"scenario_history":`+history+`,`, 1)
+			if _, err := Load([]byte(data)); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	empty := strings.Replace(authority, `"revision":2,`, `"revision":2,"scenario_history":{"overseas":[{"default_line_id":"direct"}]},`, 1)
+	if _, err := Load([]byte(empty)); err != nil {
+		t.Fatalf("a version without bindings is valid: %v", err)
+	}
+}

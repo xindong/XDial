@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Libbox
 import os.log
 import SwiftUI
 
@@ -79,6 +80,7 @@ protocol TunnelEngine: AnyObject {
     var status: String { get }
     var lastError: String? { get set }
     var dataPathSummary: String? { get set }
+    var lineProbeReadings: [LineProbeReading] { get }
     /// 自检没通过、连接保留期间正在补测。只有真实隧道会补测，其余实现恒为 false。
     var dataPathRechecking: Bool { get }
     var connectedAt: Date? { get }
@@ -128,6 +130,7 @@ protocol TunnelEngine: AnyObject {
 }
 
 extension TunnelEngine {
+    var lineProbeReadings: [LineProbeReading] { [] }
     var dataPathVerifiedPublisher: AnyPublisher<Void, Never> { Empty().eraseToAnyPublisher() }
     var dataPathRechecking: Bool { false }
     var connectedAt: Date? { nil }
@@ -256,7 +259,7 @@ protocol TunnelManaging: AnyObject {
                       allowSystemOnDemand: Bool,
                       origin: ConnectionTimeline.StartOrigin,
                       completion: @escaping @Sendable (Result<Void, Error>) -> Void)
-    /// 保存用户的系统级重连意图。启用请求只会在连接验收通过且安全启动包可用后生效。
+    /// 保存用户的系统级重连意图。手动启动提交成功且安全启动包可用后由系统接管。
     func setSystemOnDemandEnabled(_ enabled: Bool)
     /// Tailscale 独立设置期间临时暂停系统接管。与用户开关不同，这个租约必须保留
     /// 已验收的安全启动包，并在系统偏好确认停用后才回调。
@@ -543,7 +546,7 @@ final class AppState: ObservableObject {
     /// 「打开 XDial 后自动连接」。只决定启动后是否发起一次普通连接，不接管系统层的按需连接。
     /// 当前的「数据使用说明」版本。App Store 审核指南 5.4 要求 VPN App 在用户使用服务前
     /// 说明收集哪些数据、如何使用；用户确认之前不发起连接，也不做需要联网的自动判断。
-    static let dataUseNoticeVersion = 4
+    static let dataUseNoticeVersion = 5
     @Published private(set) var dataUseNoticeAccepted: Bool
 
     func acceptDataUseNotice() {
@@ -1177,7 +1180,10 @@ final class AppState: ObservableObject {
         }
     }
 
+    var waitingForNetwork: Bool { engine.status == "disconnected" && systemOnDemandState == .active }
+
     var statusText: String {
+        if waitingForNetwork { return tr("等待网络恢复…", "Waiting for Network…") }
         if tailscaleSetupLineID != nil {
             let name = profile.lines.first(where: { $0.id == tailscaleSetupLineID })?.name
                 ?? "Tailscale"
@@ -1239,7 +1245,7 @@ final class AppState: ObservableObject {
         self.openConnectPending = connectOnOpen
         self.systemOnDemandEnabled = persistence.defaults.object(
             forKey: persistence.systemOnDemandKey
-        ) as? Bool ?? false
+        ) as? Bool ?? true
         self.systemOnDemandState = tunnelManager?.systemOnDemandState
             ?? (systemOnDemandEnabled ? .failed("系统连接管理层不可用") : .disabled)
         onDemandStateSub = tunnelManager?.systemOnDemandStatePublisher
@@ -1295,6 +1301,9 @@ final class AppState: ObservableObject {
             updatePendingRuntimeChanges()
         }
 
+        if current == "connected" || current == "action-required" || current == "reconnecting" {
+            openConnectPending = false
+        }
         if current == "connected" {
             if previous == "action-required" {
                 let running = Set((runningProfileSnapshot?.lines ?? []).filter { $0.enabled && $0.type == "tailscale" }.map(\.id))
@@ -1362,16 +1371,16 @@ final class AppState: ObservableObject {
         // previous "connected" value while this callback handles "disconnected".
         // Validate configuration here and let the delayed task use canConnect
         // after the new runtime status has settled.
+        let delaySeconds = LibboxConnectionRetrySeconds(autoReconnectAttempt)
         guard autoReconnectEnabled,
               wasUnexpected,
               !engine.isBusy,
               isConnectionConfigured,
-              autoReconnectAttempt < 3 else { return }
+              delaySeconds > 0 else { return }
         autoReconnectAttempt += 1
-        let delaySeconds = [1, 2, 5][autoReconnectAttempt - 1]
         engine.lastError = tr(
-            "连接中断，\(delaySeconds) 秒后自动重试（\(autoReconnectAttempt)/3）",
-            "Connection interrupted; retrying in \(delaySeconds)s (\(autoReconnectAttempt)/3)"
+            "连接中断，\(delaySeconds) 秒后自动重试（\(autoReconnectAttempt)/\(LibboxConnectionRetryLimit)）",
+            "Connection interrupted; retrying in \(delaySeconds)s (\(autoReconnectAttempt)/\(LibboxConnectionRetryLimit))"
         )
         autoReconnectTask?.cancel()
         autoReconnectTask = Task { @MainActor [weak self] in
@@ -1380,6 +1389,10 @@ final class AppState: ObservableObject {
             self.autoReconnectTask = nil
             self.connect(origin: .autoRetry)
         }
+    }
+
+    func cancelPendingLaunchConnection() {
+        openConnectPending = false
     }
 
     /// 打开 XDial 后自动连接一次。首页在 App 回到前台、读完系统里的连接状态并按网络选好场景后调用。
@@ -1391,7 +1404,11 @@ final class AppState: ObservableObject {
         await refreshTunnelProfileStatusAndWait()
         // 等待期间用户可能已经点了连接或断开，那就以用户为准。
         guard openConnectPending, !Task.isCancelled, contextIsCurrent() else { return false }
+        // A system cold start can fail before reaching connected. Let the next idle
+        // transition finish this launch decision without racing the system start.
+        guard engine.status != "connecting", engine.status != "disconnecting" else { return false }
         openConnectPending = false
+        guard tunnelManager?.systemOnDemandActive != true else { return false }
         guard AutomaticConnectionPolicy.shouldConnectOnLaunch(
             enabled: connectOnOpenEnabled,
             initialStatusSynchronized: true,
@@ -1854,7 +1871,8 @@ final class AppState: ObservableObject {
             normalizeLegacyProfile(&loaded)
             // 预置配置有新增时，给老配置补一次；每个 revision 只补一次，用户之后删掉的不会再回来。
             if let pendingSeed {
-                loaded.adding(seed: pendingSeed.profile, ruleSetHistory: pendingSeed.ruleSetHistory)
+                loaded.adding(seed: pendingSeed.profile, ruleSetHistory: pendingSeed.ruleSetHistory,
+                              scenarioHistory: pendingSeed.scenarioHistory)
             }
             let normalizationChanged = loaded != profileBeforeNormalization
             profile = loaded
@@ -1911,7 +1929,8 @@ final class AppState: ObservableObject {
             preexistingQuarantine.merge(migration.quarantine) { current, _ in current }
             normalizeLegacyProfile(&loaded)
             if let pendingSeed {
-                loaded.adding(seed: pendingSeed.profile, ruleSetHistory: pendingSeed.ruleSetHistory)
+                loaded.adding(seed: pendingSeed.profile, ruleSetHistory: pendingSeed.ruleSetHistory,
+                              scenarioHistory: pendingSeed.scenarioHistory)
             }
             profile = loaded
             lastPersistedProfile = loaded

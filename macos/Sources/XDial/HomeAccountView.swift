@@ -12,6 +12,7 @@ struct HomeAccountView: View {
     @State private var server = ""
     @State private var username = ""
     @State private var password = ""
+    @State private var confirmingSignOut = false
     @State private var saveError: String?
     @State private var formHeight: CGFloat = 270
 
@@ -32,6 +33,11 @@ struct HomeAccountView: View {
             .scrollBounceBehavior(.basedOnSize)
             .frame(height: min(formHeight, 380))
             HStack {
+                if let line, !line.vpnUsername.isEmpty || !line.vpnPassword.isEmpty,
+                   !sourceOwned || owner?.lineCredentialsBelongToUser == true {
+                    Button(state.tr("退出账号", "Sign Out"), role: .destructive) { confirmingSignOut = true }
+                        .disabled(!editable)
+                }
                 Spacer()
                 Button(state.tr("取消", "Cancel")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(request.connectScenarioID == nil ? state.tr("保存", "Save") : state.tr("保存并连接", "Save and Connect")) {
@@ -54,6 +60,12 @@ struct HomeAccountView: View {
             password = line?.vpnPassword ?? ""
         }
         .onDisappear { password = "" }
+        .alert(state.tr("退出这条线路的账号？", "Sign out of this line?"), isPresented: $confirmingSignOut) {
+            Button(state.tr("取消", "Cancel"), role: .cancel) {}
+            Button(state.tr("退出账号", "Sign Out"), role: .destructive) { submit(signingOut: true) }
+        } message: {
+            Text(state.tr("XDial 将清除此线路保存的用户名和密码。", "XDial will clear the username and password saved for this line."))
+        }
     }
 
     private var fields: some View {
@@ -94,14 +106,14 @@ struct HomeAccountView: View {
         .padding(3)
     }
 
-    private func submit() {
+    private func submit(signingOut: Bool = false) {
         guard editable, let index = state.profile.lines.firstIndex(where: { $0.id == request.lineID }) else { return }
         let previousLibrary = state.profileLibrary
-        if !sourceOwned || state.profile.lines[index].vpnServer.isEmpty {
+        if !signingOut && (!sourceOwned || state.profile.lines[index].vpnServer.isEmpty) {
             state.profile.lines[index].vpnServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        state.profile.lines[index].vpnUsername = username
-        state.profile.lines[index].vpnPassword = password
+        state.profile.lines[index].vpnUsername = signingOut ? "" : username
+        state.profile.lines[index].vpnPassword = signingOut ? "" : password
         state.profile.lines[index].verified = false
         state.save()
         if let error = state.profilePersistenceError {
@@ -111,6 +123,6 @@ struct HomeAccountView: View {
             return
         }
         dismiss()
-        if let id = request.connectScenarioID { state.connectScenario(id) }
+        if !signingOut, let id = request.connectScenarioID { state.connectScenario(id) }
     }
 }

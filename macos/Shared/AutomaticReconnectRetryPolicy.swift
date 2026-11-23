@@ -7,6 +7,7 @@ enum ConnectionFailureCode {
 }
 
 enum AutomaticReconnectTrigger: String, Codable {
+    case userConnection = "user-connection"
     case automaticConnection = "automatic-connection"
     /// A parked recovery resumed because settled host network facts changed.
     /// Before 2026-08-16 this raw value named a removed Underlay-change
@@ -243,7 +244,7 @@ struct AutomaticReconnectRetryPolicy {
     let stableResetInterval: TimeInterval
 
     init(
-        delays: [TimeInterval] = [2, 5, 10, 20, 30],
+        delays: [TimeInterval],
         stableResetInterval: TimeInterval = 5 * 60
     ) {
         self.delays = delays
@@ -286,7 +287,7 @@ struct AutomaticReconnectRetryPolicy {
             return false
         }
         switch trigger {
-        case .automaticConnection, .underlayChange, .unexpectedDisconnect:
+        case .userConnection, .automaticConnection, .underlayChange, .unexpectedDisconnect:
             return AutomaticReconnectFailurePolicy.isTransient(report.error)
         }
     }

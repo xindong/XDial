@@ -87,7 +87,7 @@ func (l *Libbox) resolveAndroidServerContext(ctx context.Context, server, system
 	defer bootstrap.instance.Close()
 	addresses, err := bootstrap.router.Lookup(bootstrap.ctx, host, adapter.DNSQueryOptions{Transport: bootstrap.transport, Strategy: C.DomainStrategyIPv4Only})
 	if err != nil {
-		return "", fmt.Errorf("server IPv4 lookup failed")
+		return "", redactedFailure{"server IPv4 lookup failed", err}
 	}
 	for _, address := range addresses {
 		if address.Is4() {
@@ -95,4 +95,8 @@ func (l *Libbox) resolveAndroidServerContext(ctx context.Context, server, system
 		}
 	}
 	return "", fmt.Errorf("server endpoint has no IPv4 address")
+}
+
+func (l *Libbox) StartAndroidSessionResult(profileJSON, configJSON, systemDNSJSON string) *StartupResult {
+	return startupResult("", l.StartAndroidSession(profileJSON, configJSON, systemDNSJSON))
 }

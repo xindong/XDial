@@ -114,3 +114,43 @@ struct HostUnderlayCaptureResolution {
         return latestEvidence ?? .missingPathUpdate
     }
 }
+
+/// 选出 Underlay 的 resolver。
+///
+/// Underlay 的 DNS 是**启动前默认接口作用域**的那一份，不是
+/// `State:/Network/Global/DNS`。全局 DNS 可以被另一个虚拟网络接管——例如
+/// Tailscale MagicDNS 会把它改写成只在自己的 utun 上可达的 100.100.100.100。
+/// XDial 不识别网络产品，但一旦把这种地址当成 Underlay 的系统 DNS，凡是本次
+/// 事务没有承载那个虚拟接口的场景，归直连裁决的域名就会整片解析进黑洞，而走
+/// 其它线路解析的域名看起来一切正常。
+///
+/// 取不到作用域 resolver 时退回全局 DNS，保持既有行为：宁可沿用旧语义，也不
+/// 让连接因为读不到一个 SCDynamicStore 键而失败。
+enum UnderlayResolverSelection {
+    /// - Parameters:
+    ///   - interfaceName: 本次快照已经选定的默认接口。传 nil 表示不校验主接口，
+    ///     直接采信系统当前的主服务。
+    ///   - primaryInterface: `State:/Network/Global/IPv4` 的 PrimaryInterface。
+    ///   - primaryService: `State:/Network/Global/IPv4` 的 PrimaryService。
+    ///   - scopedAddresses: 主服务作用域 DNS 的 ServerAddresses。
+    ///   - globalAddresses: `State:/Network/Global/DNS` 的 ServerAddresses。
+    static func serverAddresses(
+        interfaceName: String?,
+        primaryInterface: String?,
+        primaryService: String?,
+        scopedAddresses: [String]?,
+        globalAddresses: [String]?
+    ) -> [String]? {
+        if let scoped = scopedAddresses,
+           !scoped.isEmpty,
+           let service = primaryService,
+           !service.isEmpty,
+           interfaceName == nil || primaryInterface == interfaceName {
+            return scoped
+        }
+        guard let global = globalAddresses, !global.isEmpty else {
+            return nil
+        }
+        return global
+    }
+}

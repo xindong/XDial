@@ -15,6 +15,7 @@ struct SettingsView: View {
         Form {
             Section { CloudConfigurationSettings(sync: app.cloudSync, chinese: app.language == .zh) }
             languageSection
+            Toggle(app.tr("换网络后自动连回", "Reconnect when the network changes"), isOn: $app.systemOnDemandEnabled)
             statusSection
             privacySection
             debugSection

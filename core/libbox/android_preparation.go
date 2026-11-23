@@ -93,7 +93,8 @@ func newResourceBox(ctx context.Context, data []byte, outboundTag, resolverTag s
 		return nil, fmt.Errorf("protected network unavailable")
 	}
 	if err = instance.Start(); err != nil {
-		return fail()
+		instance.Close()
+		return nil, redactedFailure{"protected network unavailable", err}
 	}
 	router := service.FromContext[adapter.DNSRouter](ctx)
 	transports := service.FromContext[adapter.DNSTransportManager](ctx)
@@ -137,7 +138,7 @@ func (b *androidBootstrap) fetchResource(rawURL string, limit int64, source bool
 	}
 	content, err := fetch(b.ctx, rawURL, limit, lookup, dial)
 	if err != nil {
-		return nil, fmt.Errorf("protected resource fetch failed")
+		return nil, redactedFailure{"protected resource fetch failed", err}
 	}
 	return content, nil
 }
@@ -200,7 +201,7 @@ func (l *Libbox) prepareAndroidConfigContext(parentContext context.Context, prof
 	}()
 	fetch := func(rawURL string, limit int64) ([]byte, error) {
 		if err := parent.Err(); err != nil {
-			return nil, fmt.Errorf("configuration preparation cancelled")
+			return nil, redactedFailure{"configuration preparation cancelled", err}
 		}
 		if bootstrap == nil {
 			var err error
@@ -248,10 +249,14 @@ func (l *Libbox) prepareAndroidConfigContext(parentContext context.Context, prof
 		return "", err
 	}
 	if parent.Err() != nil {
-		return "", fmt.Errorf("configuration preparation cancelled")
+		return "", redactedFailure{"configuration preparation cancelled", parent.Err()}
 	}
 	if len(data) > maxNEConfigBytes {
 		return "", fmt.Errorf("generated configuration exceeds limit")
 	}
 	return string(data), nil
+}
+
+func (l *Libbox) PrepareAndroidConfigResult(profileJSON, systemDNSJSON, basePath string) *StartupResult {
+	return startupResult(l.PrepareAndroidConfig(profileJSON, systemDNSJSON, basePath))
 }

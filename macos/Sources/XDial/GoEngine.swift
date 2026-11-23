@@ -202,7 +202,7 @@ final class GoEngine: ObservableObject {
             releaseTailscaleSetupForConnection { result in
                 guard !self.tailscaleSwitchHandoffCancelled else {
                     self.tailscaleConfigurationLease.resume()
-                    completion(.failure(self.requestError("场景切换已取消"))); return
+                    completion(.failure(ProviderScenarioSwitchRejectedError.cancelled)); return
                 }
                 if case let .failure(error) = result {
                     self.tailscaleConfigurationLease.resume()
@@ -216,10 +216,7 @@ final class GoEngine: ObservableObject {
                 ) { [weak self] result in
                     Task { @MainActor [weak self] in
                         self?.tailscaleConfigurationLease.resume()
-                        switch result {
-                        case let .success(report): self?.applyConnectionReport(report)
-                        case let .failure(error): self?.lastError = error.localizedDescription
-                        }
+                        if case let .success(report) = result { self?.applyConnectionReport(report) }
                         completion(result)
                     }
                 }
@@ -251,9 +248,9 @@ final class GoEngine: ObservableObject {
         #endif
     }
 
-    func cancelScenarioSwitch() {
+    func cancelScenarioSwitch(reason: ScenarioSwitchCancellationReason) {
         tailscaleSwitchHandoffCancelled = true
-        transparentProxy.cancelScenarioSwitch()
+        transparentProxy.cancelScenarioSwitch(reason: reason)
     }
 
     func captureCurrentUnderlayFingerprint(

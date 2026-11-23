@@ -5,6 +5,7 @@ struct ConfigurationView: View {
     @EnvironmentObject private var app: AppState
     @State private var section: ConfigSection = .lines
     @State private var showAddSubscription = false
+    @State private var showCloudHostSetup = false
     @State private var editingLineID: String?
     @State private var refreshingSubscriptionIDs: Set<String> = []
     @State private var subscriptionErrors: [String: String] = [:]
@@ -41,6 +42,9 @@ struct ConfigurationView: View {
                     .disabled(app.hasActiveTunnel || app.isBusy)
             }
         }
+        .sheet(isPresented: $showCloudHostSetup) {
+            CloudHostSetupSheet()
+        }
         .sheet(isPresented: $showAddSubscription) {
             AddSubscriptionView()
                 .environmentObject(app)
@@ -60,6 +64,13 @@ struct ConfigurationView: View {
                 addLineButton(type: "shadowsocks", name: "Shadowsocks")
                 addLineButton(type: "vmess", name: "VMess")
                 addLineButton(type: "tailscale", name: "Tailscale")
+                Divider()
+                Button {
+                    showCloudHostSetup = true
+                } label: {
+                    Label(app.tr("我的云主机…", "My Server…"), systemImage: "server.rack")
+                }
+                .accessibilityIdentifier("config-add-cloud-host")
             } label: {
                 Image(systemName: "plus")
             }
@@ -1964,5 +1975,32 @@ func mobileLineTypeLabel(_ type: String) -> String {
     case "vmess": return "VMess"
     case "tailscale": return "Tailscale"
     default: return type
+    }
+}
+
+/// Hosts the shared "add my server" wizard and saves the verified line through
+/// the app's normal configuration and keychain handling.
+private struct CloudHostSetupSheet: View {
+    @EnvironmentObject private var app: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model = CloudHostSetupModel()
+
+    var body: some View {
+        NavigationStack {
+            CloudHostSetupView(
+                model: model,
+                chinese: app.tr("zh", "en") == "zh",
+                saveBlockedReason: app.hasActiveTunnel || app.isBusy
+                    ? app.tr("断开连接后才能保存线路。", "Disconnect first to save the line.") : nil,
+                onSave: { draft in
+                    guard !app.hasActiveTunnel, !app.isBusy else { return false }
+                    app.profile.lines.append(Line(cloudHost: draft))
+                    return app.save()
+                },
+                onClose: { dismiss() }
+            )
+        }
+        .interactiveDismissDisabled(model.stage == .deploying)
+        .onDisappear { model.close() }
     }
 }

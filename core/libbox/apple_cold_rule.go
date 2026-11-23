@@ -47,7 +47,7 @@ func fetchAppleColdRule(profile *config.Profile, lineID, basePath, url string, l
 			line.VPNServer, ip, line.VPNUsername, line.VPNPassword, line.AllowInsecure,
 		))
 		if err != nil {
-			return nil, fmt.Errorf("rule-set download AnyConnect connection failed")
+			return nil, redactedFailure{"rule-set download AnyConnect connection failed", err}
 		}
 		defer vpn.stop()
 		ctx = service.ContextWith[*anyConnectLineRuntime](ctx, vpn.line)

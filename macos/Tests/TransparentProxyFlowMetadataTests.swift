@@ -313,6 +313,32 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
         )
     }
 
+    /// sing 的 SOCKS 服务端只把首个 UDP 数据报的目标交给 sing-box，绑定接口
+    /// 必须放在这个标记包的域名目标里；载荷不能为空，sing 读空缓存首包会返回 EOF，才能到达 DNS 转发与直连拨号。
+    func testBoundUDPAssociationMarkerIsADomainDatagramWithPlaceholderPayload() throws {
+        let marker = try XCTUnwrap(
+            TransparentProxyFlowMetadata.boundAssociationMarkerDatagram(
+                boundInterface: "utun16"
+            )
+        )
+        let envelope = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: "utun16"
+            )
+        )
+
+        XCTAssertEqual(
+            Array(marker),
+            [0x00, 0x00, 0x00, 0x03, UInt8(envelope.count)]
+                + Array(envelope) + [0x00, 0x00, 0x00]
+        )
+        XCTAssertNil(
+            TransparentProxyFlowMetadata.boundAssociationMarkerDatagram(
+                boundInterface: ""
+            )
+        )
+    }
+
     func testRejectsInvalidBoundInterfaceMetadata() {
         XCTAssertNil(
             TransparentProxyFlowMetadata.encodeBoundAssociation(

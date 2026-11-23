@@ -2,6 +2,14 @@ import XCTest
 @testable import XDial
 
 final class DataPathProbeTests: XCTestCase {
+    func testLineWarningsExposePartialResultsBeforeRoutingCheckFinishes() {
+        let direct = LineProbeReading(label: "直连", result: .timeout)
+        let vpn = LineProbeReading(label: "VPN", result: .ok)
+        XCTAssertNil(LineProbeReading.warning([vpn], isChinese: true))
+        XCTAssertEqual(LineProbeReading.warning([direct], isChinese: true), "直连探测超时")
+        XCTAssertEqual(LineProbeReading.warning([direct, vpn], isChinese: true), "直连探测超时，VPN探测通过")
+    }
+
     func testAlternateHTTPSAttributionRequiresExclusiveCounterGrowth() {
         func snapshot(_ direct: Int64, _ other: Int64) -> RoutingProbeSnapshot {
             RoutingProbeSnapshot(directTargetDirect: 0, directTargetVPN: 0, directTargetOther: 0,

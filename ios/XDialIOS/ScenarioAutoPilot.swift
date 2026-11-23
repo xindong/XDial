@@ -108,12 +108,13 @@ final class ScenarioAutoPilot {
     @ObservationIgnored private var runningGeneration = -1
     @ObservationIgnored private var lastSurveyAt: Date?
 
-    static let staleSurveyReason = "查询期间网络变了，结果作废"
-
     /// Marks a physical network change; tests use it to stand in for the path monitor.
     func noteNetworkChanged() {
         networkGeneration += 1
         lastSurveyAt = nil
+        pick = nil
+        hasSurveyed = false
+        Self.lastRecord = nil
     }
 
     /// 最近一次判断是不是还新鲜（点连接时用，避免每次都等）。
@@ -140,9 +141,8 @@ final class ScenarioAutoPilot {
                 let isFirst = self.lastPathSignature == nil
                 self.lastPathSignature = signature
                 guard !isFirst else { return }
-                self.networkGeneration += 1
+                self.noteNetworkChanged()
                 // 换网络时系统会连着报好几次，等它稳定下来再判断一次。
-                self.lastSurveyAt = nil
                 self.changeDebounce?.cancel()
                 self.changeDebounce = Task { @MainActor [weak self] in
                     try? await Task.sleep(for: .seconds(1.5))
@@ -175,12 +175,17 @@ final class ScenarioAutoPilot {
     ) async -> ScenarioAutoPicker.Pick? {
         // Merge concurrent calls only within one network; a survey from before a
         // network change must not answer for the new network.
-        if let running, runningGeneration == networkGeneration { return await running.value }
+        if let running, runningGeneration == networkGeneration {
+            let generation = networkGeneration
+            let result = await running.value
+            return networkGeneration == generation ? result : nil
+        }
         isSurveying = true
         let generation = networkGeneration
         let pathSignature = lastPathSignature
         let task = Task { () -> ScenarioAutoPicker.Pick? in
             let ssid = await NetworkProbe.currentSSID()
+            guard generation == networkGeneration else { return nil }
             let ssidRead = !(ssid?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             // 已经靠 Wi-Fi 认出来了，或者没有按地区选场景的配置，就不用去查出口。
             if let pick = ScenarioAutoPicker.pick(
@@ -205,6 +210,7 @@ final class ScenarioAutoPilot {
             } else {
                 lookup = await NetworkProbe.exitCountryCode()
             }
+            guard generation == networkGeneration else { return nil }
             let pick = ScenarioAutoPicker.pick(
                 for: NetworkSurroundings(ssid: ssid, countryCode: lookup.code),
                 scenarios: scenarios,
@@ -233,18 +239,10 @@ final class ScenarioAutoPilot {
             runningGeneration = -1
         }
         if networkGeneration != generation {
-            // The network changed while this survey ran: its answer describes a
-            // network we are no longer on. Keep the previous conclusion.
-            Self.lastRecord = ScenarioSurveyRecord(
-                at: Date(), ssidRead: false, ssidMatched: false,
-                exit: .failed(viaTunnel: exitCountryViaTunnel != nil, reason: Self.staleSurveyReason),
-                picked: false
-            )
             isSurveying = running != nil
             return nil
         }
-        // 这次没查出来（比如刚好断网）就保留上一次的结论，不把界面上的说明清掉。
-        if let result { pick = result }
+        pick = result
         isSurveying = false
         hasSurveyed = true
         lastSurveyAt = Date()

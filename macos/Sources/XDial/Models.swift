@@ -884,6 +884,66 @@ struct Scenario: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+/// Routing a preset revision shipped for one Scenario (scenario_history): the
+/// default exit and the ordered rule bindings, all on preset lines. A Scenario
+/// whose routing still equals one of these was left as shipped, so a newer
+/// preset may replace it; name, icon and Wi-Fi triggers are never part of it.
+struct ShippedScenarioRouting: Hashable, Sendable {
+    struct Binding: Hashable, Sendable {
+        var ruleSetID: String
+        var lineID: String
+    }
+
+    var defaultLineID: String
+    var bindings: [Binding]
+
+    init(defaultLineID: String, bindings: [Binding]) {
+        self.defaultLineID = defaultLineID
+        self.bindings = bindings
+    }
+
+    /// The routing a Scenario has now. Subscription exits, rule conditions and a
+    /// custom match order are things only a user sets, so such a Scenario never
+    /// equals a shipped version. `ignoring` skips bindings the app maintains itself.
+    init?(_ scenario: Scenario, ignoring: (String) -> Bool = { _ in false }) {
+        guard scenario.defaultSubscriptionID.isEmpty,
+              scenario.matchOrder.allSatisfy(ignoring) else { return nil }
+        var bindings: [Binding] = []
+        for binding in scenario.bindings where !ignoring(binding.ruleSetID) {
+            guard binding.subscriptionID.isEmpty, binding.conditionIDs.isEmpty else { return nil }
+            bindings.append(Binding(ruleSetID: binding.ruleSetID, lineID: binding.lineID))
+        }
+        self.init(defaultLineID: scenario.defaultLineID, bindings: bindings)
+    }
+
+    /// The same routing after the importer or the merge renamed lines and rules.
+    func mapped(lines: [String: String], rules: [String: String] = [:]) -> ShippedScenarioRouting {
+        ShippedScenarioRouting(
+            defaultLineID: lines[defaultLineID] ?? defaultLineID,
+            bindings: bindings.map {
+                Binding(ruleSetID: rules[$0.ruleSetID] ?? $0.ruleSetID, lineID: lines[$0.lineID] ?? $0.lineID)
+            }
+        )
+    }
+
+    /// Parses one scenario_history version; nil when it carries anything but
+    /// `default_line_id` and `bindings` of `rule_set_id` / `line_id` strings.
+    static func decode(_ raw: Any) -> ShippedScenarioRouting? {
+        guard let object = raw as? [String: Any],
+              Set(object.keys).isSubset(of: ["default_line_id", "bindings"]),
+              let defaultLineID = object["default_line_id"] as? String, !defaultLineID.isEmpty,
+              let rawBindings = (object["bindings"] ?? [Any]()) as? [Any] else { return nil }
+        var bindings: [Binding] = []
+        for item in rawBindings {
+            guard let binding = item as? [String: Any], Set(binding.keys) == ["rule_set_id", "line_id"],
+                  let rule = binding["rule_set_id"] as? String, !rule.isEmpty,
+                  let line = binding["line_id"] as? String, !line.isEmpty else { return nil }
+            bindings.append(Binding(ruleSetID: rule, lineID: line))
+        }
+        return ShippedScenarioRouting(defaultLineID: defaultLineID, bindings: bindings)
+    }
+}
+
 struct ImportAdjustment: Codable, Hashable, Sendable {
     var code: String
     var count: Int

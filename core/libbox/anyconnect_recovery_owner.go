@@ -2,14 +2,11 @@ package libbox
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	stdjson "encoding/json"
-	"errors"
 	"fmt"
+	"github.com/kafeifei/xdial/core/recovery"
 	"io"
-	"net"
-	"syscall"
+	"time"
 
 	"github.com/kafeifei/xdial/core/engine"
 	"sslcon/session"
@@ -63,6 +60,9 @@ func (c *anyConnectRuntimeCapability) observeNetwork(epoch string, underlay line
 			c.sessionInterface = underlay.defaultInterface
 		}
 	}
+	if c.sessionEpoch == "" && c.session != nil {
+		c.sessionEpoch = epoch
+	}
 	if config != nil {
 		c.config = *config
 	}
@@ -83,6 +83,29 @@ func (c *anyConnectRuntimeCapability) transportCarrierGoneLocked() bool {
 	return c.networkManaged && c.session != nil &&
 		c.sessionInterface != "" && c.networkUnderlay.interfaces != nil &&
 		!c.networkUnderlay.interfaces[c.sessionInterface]
+}
+
+// anyConnectStaleProbeBudget is the first readiness probe's share when the
+// session's age on the current network is unknown. It only has to expose a
+// session left over from an earlier network, so it stays short.
+var anyConnectStaleProbeBudget = 2 * time.Second
+
+// readinessProbeBudget bounds the probe that decides whether the session must
+// be re-established. A session established on this epoch was just
+// authenticated over this Underlay, and its handshake took several round
+// trips; a healthy probe through it takes fewer. Half of that handshake time
+// keeps the probe from declaring a slow but working network dead (about one
+// second per round trip made the fixed budget expire every time). A session
+// from another epoch keeps the short budget: its handshake measured a network
+// that is gone.
+func (c *anyConnectRuntimeCapability) readinessProbeBudget(epoch string) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	budget := anyConnectStaleProbeBudget
+	if c.session != nil && epoch != "" && c.sessionEpoch == epoch && c.sessionConnectTime/2 > budget {
+		budget = c.sessionConnectTime / 2
+	}
+	return budget
 }
 
 func (c *anyConnectRuntimeCapability) ensureTransport(ctx context.Context, force bool, expectedRevision ...uint64) error {
@@ -182,18 +205,20 @@ func (c *anyConnectRuntimeCapability) runRecovery(work *anyConnectRecovery) {
 		// A later epoch may carry a freshly resolved dial address for the
 		// same identity; each attempt dials with what the owner observed last.
 		c.mu.Lock()
-		attemptInterface := c.networkUnderlay.defaultInterface
+		attemptInterface, attemptEpoch := c.networkUnderlay.defaultInterface, c.networkEpoch
 		config = c.config
 		c.mu.Unlock()
 		owner.notifyAnyConnectCapability(c, "line_reconnecting", attempt)
+		attemptStarted := time.Now()
 		info, err := c.vpn.Connect(config)
+		connectTime := time.Since(attemptStarted)
 		if err != nil {
 			lastErr = err
 			c.vpn.Disconnect()
 			if !budget.settle() {
 				continue
 			}
-			if strict && !transientLineReadinessError(err) {
+			if strict && !recovery.IsTransient(err) {
 				break
 			}
 			continue
@@ -233,6 +258,7 @@ func (c *anyConnectRuntimeCapability) runRecovery(work *anyConnectRecovery) {
 		}
 		c.mu.Lock()
 		c.sessionInterface = attemptInterface
+		c.sessionEpoch, c.sessionConnectTime = attemptEpoch, connectTime
 		c.mu.Unlock()
 		owner.syncAnyConnectCapability(c)
 		owner.notifyAnyConnectCapability(c, "line_connected", attempt)
@@ -334,33 +360,4 @@ func (l *Libbox) monitorRecoveredCapability(c *anyConnectRuntimeCapability, sess
 	if active {
 		go l.monitorSession(generation, sess)
 	}
-}
-
-// Classification is based solely on typed causes. sslcon's untyped auth and
-// configuration failures intentionally stay terminal until it exposes a typed
-// contract; an unknown string must never start an automatic retry loop.
-func transientLineReadinessError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var verification *tls.CertificateVerificationError
-	var unknownAuthority x509.UnknownAuthorityError
-	var invalid x509.CertificateInvalidError
-	var hostname x509.HostnameError
-	if errors.As(err, &verification) || errors.As(err, &unknownAuthority) || errors.As(err, &invalid) || errors.As(err, &hostname) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var networkError net.Error
-	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
-		return true
-	}
-	for _, cause := range []error{syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ETIMEDOUT, syscall.ENETDOWN, syscall.EPIPE} {
-		if errors.Is(err, cause) {
-			return true
-		}
-	}
-	return false
 }

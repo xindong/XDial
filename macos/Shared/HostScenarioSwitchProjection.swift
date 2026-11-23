@@ -1,3 +1,8 @@
+enum ScenarioSwitchCancellationReason: String {
+    case superseded, userCancelled, disconnected, sleep, timeout
+    case automaticModeChanged, wifiSettling, scenarioMatchChanged, unmatchedWiFi, underlayChanged, recovery
+}
+
 /// Separate host-side Switch fact projection. It deliberately does not replace
 /// the authoritative committed ConnectionReport while a candidate is pending
 /// or when that candidate fails.
@@ -17,6 +22,12 @@ struct HostScenarioSwitchProjection: Equatable {
     let reusedLineIDs: [String]
     let code: String?
     let message: String?
+
+    static func failureStatus(code: String, cancellationRequested: Bool, timedOut: Bool) -> String {
+        if timedOut { return "timed-out" }
+        if cancellationRequested && code == "switch-cancelled" { return "cancelled" }
+        return "failed"
+    }
 
     /// Called only after the host has validated the Provider's committed report.
     static func committed(

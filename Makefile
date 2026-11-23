@@ -306,7 +306,7 @@ app-debug: app
 test-scenario-layout:
 	python3 test/scenario_layout_test.py "$(APP_BUNDLE)"
 
-app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
+app: cli-debug $(MACOS_LIBBOX_BINARY) macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration $(DEVELOPMENT_CONFIGURATION) \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(DEVELOPMENT_DERIVED_DATA) \
@@ -329,7 +329,7 @@ app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIco
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
-ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
+ci-macos-build: cli cli-debug $(MACOS_LIBBOX_BINARY) macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@set -e; for configuration in Debug Release; do \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
@@ -366,7 +366,7 @@ release-helper: release-inputs $(PATCHED_WORKFILE)
 		-ldflags "-X main.version=$(RELEASE_TAG) -s -w" \
 		-o $(BUILD_DIR)/xdial ./cmd/xdial/
 
-release-app: release-helper libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
+release-app: release-helper $(MACOS_LIBBOX_BINARY) macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
@@ -431,7 +431,7 @@ inspector:
 	swiftc -O tools/inspector.swift -o $(BUILD_DIR)/xdial-inspector
 
 .PHONY: test-profile-document-bridge
-test-profile-document-bridge: libbox-macos-xcframework
+test-profile-document-bridge: $(MACOS_LIBBOX_BINARY)
 	swiftc -target arm64-apple-macos15.0 \
 		-F $(BUILD_DIR)/frameworks/macos/Libbox.xcframework/macos-arm64_x86_64 \
 		-framework Libbox -framework Foundation -framework Security \
@@ -470,6 +470,7 @@ libbox-xcframework: check-mobile-libbox-deps
 	@if find $(BUILD_DIR)/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'uTLS is not included in this build'; then \
 		echo 'error: Libbox was built without uTLS client fingerprint support'; exit 1; \
 	fi
+	python3 scripts/build-shared-libbox.py $(BUILD_DIR)/Libbox.xcframework $(BUILD_DIR)/shared/tvos/Libbox.xcframework
 
 # iOS 使用独立 XCFramework，避免 iOS/tvOS slice 互相覆盖。
 libbox-ios-xcframework: check-mobile-libbox-deps
@@ -482,10 +483,14 @@ libbox-ios-xcframework: check-mobile-libbox-deps
 	@if find $(BUILD_DIR)/frameworks/ios/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'uTLS is not included in this build'; then \
 		echo 'error: Libbox was built without uTLS client fingerprint support'; exit 1; \
 	fi
+	python3 scripts/build-shared-libbox.py $(BUILD_DIR)/frameworks/ios/Libbox.xcframework $(BUILD_DIR)/shared/ios/Libbox.xcframework
 
 # macOS Transparent Proxy 与移动端复用同一个进程内 Libbox 数据面。用文件依赖保证
 # core 变化后桌面构建不会继续链接旧 XCFramework。
-libbox-macos-xcframework: $(MACOS_LIBBOX_BINARY)
+libbox-macos-xcframework: $(BUILD_DIR)/shared/macos/Libbox.xcframework/Info.plist
+
+$(BUILD_DIR)/shared/macos/Libbox.xcframework/Info.plist: $(MACOS_LIBBOX_BINARY) scripts/build-shared-libbox.py
+	python3 scripts/build-shared-libbox.py $(MACOS_LIBBOX_FRAMEWORK) $(BUILD_DIR)/shared/macos/Libbox.xcframework
 
 $(MACOS_LIBBOX_BINARY): $(LIBBOX_GO_SOURCES) go.mod go.sum Makefile $(PATCHED_WORKFILE)
 	$(MAKE) check-mobile-libbox-deps

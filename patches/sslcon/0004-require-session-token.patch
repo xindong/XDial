@@ -1,0 +1,98 @@
+diff --git a/auth/auth.go b/auth/auth.go
+index 4b4f4db..96d552a 100644
+--- a/auth/auth.go
++++ b/auth/auth.go
+@@ -204,7 +204,10 @@ func PasswordAuth() error {
+ 	if WebVpnCookie != "" {
+ 		session.Sess.SessionToken = WebVpnCookie
+ 	}
+-	base.Debug("SessionToken:" + session.Sess.SessionToken)
++	if strings.TrimSpace(session.Sess.SessionToken) == "" {
++		AbortHandshake()
++		return errors.New("authentication completed without a session token")
++	}
+ 	return nil
+ }
+ 
+@@ -259,9 +262,6 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
+ 		AbortHandshake()
+ 		return handshakeError("authentication response body", err)
+ 	}
+-	if base.Cfg.LogLevel == "Debug" {
+-		base.Debug(string(body))
+-	}
+ 
+ 	if resp.StatusCode == http.StatusOK {
+ 		err = xml.Unmarshal(body, dtd)
+@@ -269,7 +269,7 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
+ 			AbortHandshake()
+ 			return errors.New("secure tunnel handshake failed during authentication response parsing")
+ 		}
+-		if dtd.Type == "complete" && dtd.SessionToken == "" {
++		if dtd.Type == "complete" && strings.TrimSpace(dtd.SessionToken) == "" {
+ 			// 兼容 ocserv
+ 			cookies := resp.Cookies()
+ 			if len(cookies) != 0 {
+diff --git a/auth/auth_test.go b/auth/auth_test.go
+index 1d8f88f..5d8ad83 100644
+--- a/auth/auth_test.go
++++ b/auth/auth_test.go
+@@ -19,6 +19,7 @@ import (
+ 	"time"
+ 
+ 	"sslcon/proto"
++	"sslcon/session"
+ )
+ 
+ func TestTplPostTimesOutWhenServerDoesNotRespond(t *testing.T) {
+@@ -261,3 +262,50 @@ func testCertificate(t *testing.T) tls.Certificate {
+ 	}
+ 	return certificate
+ }
++
++func TestPasswordAuthRequiresSessionToken(t *testing.T) {
++	for _, tc := range []struct {
++		name, xmlToken, cookie, want string
++	}{
++		{"missing", "", "", ""},
++		{"blank", "  ", "", ""},
++		{"xml", "xml-token", "", "xml-token"},
++		{"cookie", "", "cookie-token", "cookie-token"},
++		{"cookie with blank XML", "  ", "cookie-token", "cookie-token"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			client, server := authenticatedTLSPipe(t)
++			defer installAuthTestConnection(t, client)()
++			oldToken, oldCookie := session.Sess.SessionToken, WebVpnCookie
++			defer func() { session.Sess.SessionToken, WebVpnCookie = oldToken, oldCookie }()
++			session.Sess.SessionToken, WebVpnCookie = "previous-token", ""
++			go func() {
++				req, err := http.ReadRequest(bufio.NewReader(server))
++				if err != nil {
++					return
++				}
++				_, _ = io.Copy(io.Discard, req.Body)
++				body := fmt.Sprintf(`<config-auth type="complete"><session-token>%s</session-token></config-auth>`, tc.xmlToken)
++				header := ""
++				if tc.cookie != "" {
++					header = "Set-Cookie: webvpn=" + tc.cookie + "\r\n"
++				}
++				_, _ = fmt.Fprintf(server, "HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n%s", header, len(body), body)
++				_, _ = io.Copy(io.Discard, server)
++			}()
++			if err := BeginHandshake(time.Second); err != nil {
++				t.Fatal(err)
++			}
++			err := PasswordAuth()
++			if tc.want == "" {
++				if err == nil || err.Error() != "authentication completed without a session token" {
++					t.Fatalf("unexpected authentication result: %v", err)
++				}
++				return
++			}
++			if err != nil || session.Sess.SessionToken != tc.want {
++				t.Fatal("did not accept the session token")
++			}
++		})
++	}
++}

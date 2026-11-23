@@ -1,6 +1,7 @@
 import XCTest
 
 final class AutomaticReconnectRetryPolicyTests: XCTestCase {
+    private let schedule: [TimeInterval] = [2, 5, 10, 20, 30]
     func testUnderlayEgressFailureUsesTheFiveAttemptSchedule() {
         let policy = AutomaticReconnectRetryPolicy(
             delays: [2, 5, 10, 20, 30]
@@ -43,7 +44,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testUnexpectedDisconnectRecoveryCanRetryACompletedLineFailure() {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         let report = failedReport(
             code: "tailscale-peer-handshake-failed"
         )
@@ -62,7 +63,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     /// network change. Its budget follows the same structured classification
     /// as every other full recovery instead of the removed egress-only rule.
     func testParkedRecoveryResumedByNetworkChangeUsesSharedClassification() {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
 
         XCTAssertEqual(policy.delay(
             after: failedReport(
@@ -102,7 +103,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testLaunchAutoConnectCanRetryACompletedLineFailure() {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         let report = failedReport(code: "tailscale-peer-handshake-failed")
 
         XCTAssertEqual(
@@ -116,7 +117,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testTerminalCodesStopFullRecoveryImmediately() throws {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         var reports = [
             "tailscale-login-required",
             "tailscale-unavailable",
@@ -134,7 +135,8 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
 
         for report in reports {
             for trigger in [
-                AutomaticReconnectTrigger.automaticConnection,
+                AutomaticReconnectTrigger.userConnection,
+                .automaticConnection,
                 .unexpectedDisconnect,
             ] {
                 XCTAssertFalse(
@@ -153,7 +155,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testTransientCodesRetryWithinTheSharedBudget() throws {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         var reports = [
             "line-readiness-transient",
             ConnectionFailureCode.underlayEgressUnavailable,
@@ -181,7 +183,8 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
 
         for report in reports {
             for trigger in [
-                AutomaticReconnectTrigger.automaticConnection,
+                AutomaticReconnectTrigger.userConnection,
+                .automaticConnection,
                 .unexpectedDisconnect,
             ] {
                 XCTAssertEqual(
@@ -210,7 +213,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     /// Unknown codes follow Scenario Switch: no structured proof of a
     /// transient fault means no retry, whatever the display text says.
     func testUnknownCodesDoNotRetryEvenWithTimeoutText() throws {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         var reports = [
             "prepare-failed",
             "scenario-switch-prepare-failed",
@@ -231,7 +234,8 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
 
         for report in reports {
             for trigger in [
-                AutomaticReconnectTrigger.automaticConnection,
+                AutomaticReconnectTrigger.userConnection,
+                .automaticConnection,
                 .unexpectedDisconnect,
             ] {
                 XCTAssertNil(policy.delay(
@@ -302,7 +306,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testDoesNotRetryBeforeRollbackCompletes() {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         var report = failedReport(
             code: ConnectionFailureCode.underlayEgressUnavailable
         )
@@ -316,7 +320,7 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     }
 
     func testFiveAttemptBudgetHasNoSixthDelay() {
-        let policy = AutomaticReconnectRetryPolicy()
+        let policy = AutomaticReconnectRetryPolicy(delays: schedule)
         XCTAssertEqual(
             (0 ..< 5).compactMap {
                 policy.delayForNextAttempt(attemptsUsed: $0)

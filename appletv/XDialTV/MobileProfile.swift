@@ -23,6 +23,8 @@ struct ProfileSeed: Equatable, Sendable {
     var revision: Int
     /// 预置改过内容的手动规则：规则 ID → 之前各版发过的匹配内容。
     var ruleSetHistory: [String: [ShippedRuleContent]] = [:]
+    /// 预置改过路由的场景：场景 ID → 之前各版发过的默认出口和规则绑定。
+    var scenarioHistory: [String: [ShippedScenarioRouting]] = [:]
 }
 
 /// 预置某一版发出的手动规则匹配内容。比较时不计顺序和大小写。
@@ -231,9 +233,11 @@ extension Profile {
 
     /// 把一份预置配置加进已经在用的配置里。只添加缺的线路、规则和场景；用户自己建的、改过的
     /// 和当前选中的场景都不动。预置里的线路如果和已有线路是同一类型、同一个服务器，就沿用已有的
-    /// 那条（账号密码还在上面），预置场景改绑到它。返回是否有改动。
+    /// 那条（账号密码还在上面），预置场景改绑到它。`scenarioHistory` 里列出的场景，路由仍等于
+    /// 之前某一版发的（用户没改过）时换成预置的新路由，名称、图标和 Wi-Fi 触发不动。返回是否有改动。
     @discardableResult
-    mutating func adding(seed: Profile, ruleSetHistory: [String: [ShippedRuleContent]] = [:]) -> Bool {
+    mutating func adding(seed: Profile, ruleSetHistory: [String: [ShippedRuleContent]] = [:],
+                         scenarioHistory: [String: [ShippedScenarioRouting]] = [:]) -> Bool {
         let before = self
 
         // 预置线路 ID → 实际使用的线路 ID。
@@ -271,6 +275,26 @@ extension Profile {
                 ruleSets[index].cidrs = ruleSet.cidrs
             } else {
                 appLog("seed: kept the user's edits to rule \(ruleSet.id)")
+            }
+        }
+
+        // 预置改过路由的场景：用户没动过（仍是之前某一版发的路由）才换成新路由，改过的保留。
+        // 比较时去掉 App 自己维护的连接验收绑定，最后由 ensureConnectivityTestConfiguration 补回。
+        for source in seed.scenarios {
+            guard let shipped = scenarioHistory[source.id],
+                  let index = scenarios.firstIndex(where: { $0.id == source.id }),
+                  let target = ShippedScenarioRouting(source, ignoring: RuleSet.isConnectivityTestRuleID)?
+                      .mapped(lines: lineIDs) else { continue }
+            let current = ShippedScenarioRouting(scenarios[index], ignoring: RuleSet.isConnectivityTestRuleID)
+            guard current != target else { continue }
+            if let current, shipped.map({ $0.mapped(lines: lineIDs) }).contains(current) {
+                scenarios[index].defaultLineID = target.defaultLineID
+                scenarios[index].bindings = target.bindings.map {
+                    RuleBinding(ruleSetID: $0.ruleSetID, lineID: $0.lineID)
+                }
+                scenarios[index].matchOrder = []
+            } else {
+                appLog("seed: kept the user's edits to scenario \(source.id)")
             }
         }
 

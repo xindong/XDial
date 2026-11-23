@@ -5,6 +5,10 @@ on:
     branches: [main, xdial-beta]
   pull_request:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   android:
     name: Android (dual ABI + inspected APK artifacts)
@@ -12,6 +16,7 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -32,9 +37,23 @@ jobs:
       - name: build and inspect debug and unsigned release APKs
         run: python3 scripts/build-android.py --mode ci
       - name: version, artifact and real signing contract tests
-        env:
-          XDIAL_ANDROID_TEST_APK: ${{ github.workspace }}/android/app/build/outputs/apk/release/app-release-unsigned.apk
-        run: python3 -m unittest discover -s scripts/tests -p 'test_android_build.py'
+        run: |
+          for abi in arm64-v8a x86_64; do
+            XDIAL_ANDROID_TEST_ABI="$abi" \
+            XDIAL_ANDROID_TEST_APK="$PWD/android/app/build/outputs/apk/release/app-$abi-release-unsigned.apk" \
+              python3 -m unittest discover -s scripts/tests -p 'test_android_build.py'
+          done
+      - uses: ./.github/actions/package-size
+        with:
+          group: android
+          paths: |
+            android/app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk
+            android/app/build/outputs/apk/release/app-x86_64-release-unsigned.apk
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: android-play-unsigned
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
       # These contain only the public source build. Public-repo artifacts are
       # not private distribution; no company seed or long-lived signer is used.
       - uses: actions/upload-artifact@v7.0.2
@@ -96,6 +115,8 @@ jobs:
           echo "$PWD/build/tools" >> "$GITHUB_PATH"
       - name: go test
         run: make test
+      - name: package size report contract tests
+        run: python3 -m unittest discover -s scripts/tests -p test_package_size.py -v
       - name: tvOS preset acceptance gates
         run: python3 -m unittest discover -s scripts/tests -p test_tvos_store_app.py -v
 
@@ -127,3 +148,66 @@ jobs:
             -configuration Release -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath build/macos-tests-release \
             CODE_SIGNING_ALLOWED=NO test
+
+      - uses: ./.github/actions/package-size
+        with:
+          group: macos-standalone
+          paths: build/macos-xcode-ci/Build/Products/Release/XDial.app
+
+  apple-store-size:
+    name: Store package size (${{ matrix.platform }})
+    # Xcode 26.6 crashes emitting tvOS Swift IR; Xcode 27 matches local archives.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: iOS, make: libbox-ios-xcframework, spec: ios/project.yml, project: ios/XDialIOS, scheme: XDialIOS, app: XDial}
+          - {platform: tvOS, make: libbox-xcframework, spec: appletv/project.yml, project: appletv/XDialTV, scheme: XDialTV, app: XDialTV}
+          - {platform: macOS, make: libbox-macos-xcframework, spec: macos/store.yml, project: macos/XDialStore, scheme: XDialStore, app: XDial}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build the host and its extension for device architectures
+        run: |
+          brew install xcodegen ripgrep
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make ${{ matrix.make }}
+          if [ "${{ matrix.platform }}" = tvOS ]; then
+            # CI uses a public license fixture. Distribution supplies the verified inventory.
+            mkdir -p appletv/StoreResources
+            cp LICENSE appletv/StoreResources/ThirdPartyNotices.txt
+          fi
+          xcodegen generate --spec ${{ matrix.spec }}
+          xcodebuild -project ${{ matrix.project }}.xcodeproj -scheme ${{ matrix.scheme }} \
+            -configuration Release -destination 'generic/platform=${{ matrix.platform }}' \
+            -archivePath build/Store.xcarchive CODE_SIGNING_ALLOWED=NO archive
+          python3 scripts/verify-shared-libbox.py build/Store.xcarchive/Products/Applications/${{ matrix.app }}.app
+      - uses: ./.github/actions/package-size
+        with:
+          group: store-${{ matrix.platform }}
+          paths: build/Store.xcarchive/Products/Applications/${{ matrix.app }}.app
+
+  linux-size:
+    name: Linux service package size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: |
+          scripts/build-linux-service.sh amd64
+          scripts/build-linux-service.sh arm64
+      - uses: ./.github/actions/package-size
+        with:
+          group: linux
+          paths: |
+            build/linux-service/xdial-service-linux-amd64.tar.gz
+            build/linux-service/xdial-service-linux-arm64.tar.gz
+      - run: echo "Windows — no distributable client on this revision." >> "$GITHUB_STEP_SUMMARY"

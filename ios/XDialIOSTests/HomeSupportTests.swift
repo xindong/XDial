@@ -86,6 +86,90 @@ final class HomeSupportTests: XCTestCase {
         XCTAssertThrowsError(try decode(["intranet": "not a list"]))
     }
 
+    /// 新一版给「在外地」加了一条排在最前的直连规则，并记下上一版发的路由。
+    private func reroutedSeed(history: Any? = nil) throws -> ProfileSeed {
+        var root = try JSONSerialization.jsonObject(with: Data(SeedFixture.json.utf8)) as! [String: Any]
+        root["revision"] = 4
+        var profile = root["profile"] as! [String: Any]
+        var rules = profile["rule_sets"] as! [[String: Any]]
+        rules.append(["id": "product", "name": "产品", "type": "manual", "enabled": true, "url": "", "format": "auto",
+                      "domains": ["product.example"], "cidrs": []])
+        profile["rule_sets"] = rules
+        var scenarios = profile["scenarios"] as! [[String: Any]]
+        let abroad = scenarios.firstIndex { $0["id"] as? String == "abroad" }!
+        let shipped = scenarios[abroad]["bindings"] as! [[String: Any]]
+        scenarios[abroad]["bindings"] = [["rule_set_id": "product", "line_id": "direct"]] + shipped
+        profile["scenarios"] = scenarios
+        root["profile"] = profile
+        root["scenario_history"] = history ?? ["abroad": [["default_line_id": "direct", "bindings": shipped]]]
+        return try MobileSeed.decode(JSONSerialization.data(withJSONObject: root)).profileSeed
+    }
+
+    func testSeedUpdatesAReroutedScenarioOnlyWhileTheUserLeftItAsShipped() throws {
+        let seed = try reroutedSeed()
+        XCTAssertEqual(seed.scenarioHistory["abroad"]?.first?.bindings.first,
+                       ShippedScenarioRouting.Binding(ruleSetID: "local-network", lineID: "direct"))
+
+        // 已装上一版的员工：VPN 线路是自己早先建的那条（预置沿用了它），场景改过名和图标。
+        var untouched = Profile()
+        untouched.lines = [
+            Line(id: "direct", name: "直连", type: "direct", verified: true),
+            Line(id: "my-vpn", name: "我的 VPN", type: "vpn", vpnServer: "vpn.example.com:8443"),
+        ]
+        untouched.adding(seed: SeedFixture.profile())
+        let abroad = untouched.scenarios.firstIndex { $0.id == "abroad" }!
+        untouched.scenarios[abroad].name = "出差"
+        untouched.scenarios[abroad].iconOverride = "office"
+        XCTAssertTrue(untouched.adding(seed: seed.profile, scenarioHistory: seed.scenarioHistory))
+        let updated = untouched.scenarios[abroad]
+        XCTAssertEqual(updated.name, "出差")
+        XCTAssertEqual(updated.iconOverride, "office")
+        XCTAssertEqual(updated.bindings.filter { !RuleSet.isConnectivityTestRuleID($0.ruleSetID) }.map(\.ruleSetID),
+                       ["product", "local-network", "intranet", "region-domains", "region-ips"])
+        XCTAssertEqual(updated.bindings.first { $0.ruleSetID == "intranet" }?.lineID, "my-vpn")
+        // 连接验收绑定仍由 App 维护，排在最前。
+        XCTAssertEqual(updated.bindings.prefix(2).map(\.ruleSetID),
+                       [RuleSet.connectivityDirectID, RuleSet.connectivityOutboundID])
+        // 没列进历史的场景不动；再启动一次不再变化。
+        XCTAssertFalse(untouched.adding(seed: seed.profile, scenarioHistory: seed.scenarioHistory))
+
+        // 员工自己调过这个场景的规则：保留。
+        var edited = Profile()
+        edited.adding(seed: SeedFixture.profile())
+        let index = edited.scenarios.firstIndex { $0.id == "abroad" }!
+        edited.scenarios[index].bindings.removeAll { $0.ruleSetID == "region-ips" }
+        let before = edited.scenarios[index]
+        edited.adding(seed: seed.profile, scenarioHistory: seed.scenarioHistory)
+        XCTAssertEqual(edited.scenarios[index].bindings, before.bindings)
+
+        // 没有场景历史的旧预置格式：已有场景照旧只补不改。
+        var legacy = Profile()
+        legacy.adding(seed: SeedFixture.profile())
+        let shipped = legacy.scenarios[index]
+        legacy.adding(seed: seed.profile)
+        XCTAssertEqual(legacy.scenarios[index].bindings, shipped.bindings)
+    }
+
+    func testSeedRejectsScenarioHistoryThatDoesNotDescribeThePreset() throws {
+        let valid: [String: Any] = ["default_line_id": "direct", "bindings": [["rule_set_id": "intranet", "line_id": "office-vpn"]]]
+        XCTAssertNoThrow(try reroutedSeed(history: ["abroad": [valid]]))
+        XCTAssertNoThrow(try reroutedSeed(history: ["abroad": [["default_line_id": "direct"]]]))
+        for bad: Any in [
+            ["missing": [valid]],
+            ["abroad": "not a list"],
+            ["abroad": [["bindings": []]]],
+            ["abroad": [["default_line_id": "missing-line"]]],
+            ["abroad": [["default_line_id": "direct", "name": "在外地"]]],
+            ["abroad": [["default_line_id": "direct", "bindings": [["rule_set_id": "missing", "line_id": "direct"]]]]],
+            ["abroad": [["default_line_id": "direct", "bindings": [["rule_set_id": "intranet", "line_id": "missing"]]]]],
+            ["abroad": [["default_line_id": "direct", "bindings": [["rule_set_id": "intranet"]]]]],
+            ["abroad": [["default_line_id": "direct",
+                         "bindings": [["rule_set_id": "intranet", "line_id": "office-vpn", "condition_ids": []]]]]],
+        ] {
+            XCTAssertThrowsError(try reroutedSeed(history: bad), "\(bad)")
+        }
+    }
+
     func testAddingSeedKeepsUserDataAndIsIdempotent() {
         let seed = SeedFixture.profile()
         // 用户已经在用的配置：自己改过预置里的同名规则，另外建了一个场景。

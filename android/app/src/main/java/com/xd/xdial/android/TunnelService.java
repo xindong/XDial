@@ -59,7 +59,14 @@ public final class TunnelService extends VpnService {
  }
  private final ConnectivityManager.NetworkCallback networks=new ConnectivityManager.NetworkCallback() {
   @Override public void onAvailable(Network network) {invalidateImport(network,null,false);observedNetworkRevision.incrementAndGet();enqueue(()->{underlay=network;links=null;capabilities=null;blocked=false;});}
-  @Override public void onCapabilitiesChanged(Network network,NetworkCapabilities value) {enqueue(()->{if(network.equals(underlay)){capabilities=value;observe();}});}
+  @Override public void onCapabilitiesChanged(Network network,NetworkCapabilities value) {enqueue(()->{
+   if(!network.equals(underlay))return;
+   int validated=NetworkCapabilities.NET_CAPABILITY_VALIDATED;
+   if(capabilities!=null && !capabilities.hasCapability(validated) && value.hasCapability(validated)){
+    lifecycle.networkBecameReachable();
+   }
+   capabilities=value;observe();
+  });}
   @Override public void onLinkPropertiesChanged(Network network,LinkProperties value) {invalidateImport(network,value,false);observedNetworkRevision.incrementAndGet();enqueue(()->{if(network.equals(underlay)){links=value;observe();}});}
   @Override public void onBlockedStatusChanged(Network network,boolean value) {if(value)invalidateImport(network,null,true);observedNetworkRevision.incrementAndGet();enqueue(()->{if(network.equals(underlay)){blocked=value;observe();}});}
   @Override public void onLost(Network network) {invalidateImport(network,null,true);observedNetworkRevision.incrementAndGet();enqueue(()->{if(network.equals(underlay)){underlay=null;links=null;capabilities=null;lifecycle.observeUnderlay("");reconcile();}});}
@@ -198,9 +205,9 @@ public final class TunnelService extends VpnService {
    String profile=profileImport==null?new ProfileStore(this).load():Libbox.profileLibraryRuntime(profileImport.library);
    stage="系统网络";
    final Network captured=underlay;
-   if(captured==null || links==null || capabilities==null)throw new java.io.IOException("Underlay unavailable");
+   if(captured==null || links==null || capabilities==null)throw new java.net.SocketException("Underlay unavailable");
    NetworkInterface nic=NetworkInterface.getByName(links.getInterfaceName());
-   if(nic==null)throw new java.io.IOException("Interface unavailable");
+   if(nic==null)throw new java.net.SocketException("Interface unavailable");
    stage="配置编译";
    JSONArray systemDNS = new JSONArray();
    for(java.net.InetAddress server : links.getDnsServers()) systemDNS.put(server.getHostAddress());
@@ -209,8 +216,7 @@ public final class TunnelService extends VpnService {
     public void onStatusChanged(String json){}
     public void onError(long code,String message){enqueue(()->{
      if(core==null || !active || coreEpoch!=epoch)return;
-     state="连接错误（"+code+"），请重新连接";
-     lifecycle.completeAttempt(epoch,false,false,SystemClock.elapsedRealtime());reconcile();
+     attemptFailed(epoch,code==Libbox.ErrCodeTransientNetwork,"连接错误（"+code+"）");
     });}
    });
    core.setSecureStateStore(new IdentityStore(this));
@@ -257,7 +263,7 @@ public final class TunnelService extends VpnService {
     if(stopRequested)throw new java.io.InterruptedIOException("Stopped");
     // Callbacks queue behind preparation: read current OS facts before using an
     // observation, so a result from a departed network cannot select a scene.
-    if(observationRevision!=observedNetworkRevision.get()||!links.equals(connectivity.getLinkProperties(captured)))throw new java.io.IOException("Underlay changed during survey");
+    if(observationRevision!=observedNetworkRevision.get()||!links.equals(connectivity.getLinkProperties(captured)))throw new java.net.SocketException("Underlay changed during survey");
     selection.observeBeforeConnect(survey,ssid,country);
     profile=new ProfileStore(this).load();
     surveyResult=queried?(country.isEmpty()?"网络地区未查到，保留场景":"网络地区："+country):"";
@@ -266,7 +272,14 @@ public final class TunnelService extends VpnService {
    }
    stage="准备离线规则";
    long beforePreparation=protectedSockets.get();
-   String config=settingUp?Libbox.generateAndroidTailscaleSetupConfig(profile,setupLine,systemDNS.toString(),getNoBackupFilesDir().getAbsolutePath()):core.prepareAndroidConfig(profile,systemDNS.toString(),getNoBackupFilesDir().getAbsolutePath());
+   String config;
+   if(settingUp){
+    config=Libbox.generateAndroidTailscaleSetupConfig(profile,setupLine,systemDNS.toString(),getNoBackupFilesDir().getAbsolutePath());
+   }else{
+    StartupResult prepared=core.prepareAndroidConfigResult(profile,systemDNS.toString(),getNoBackupFilesDir().getAbsolutePath());
+    if(!prepared.getMessage().isEmpty()){attemptFailed(epoch,prepared.getRetryable(),"准备配置失败");return;}
+    config=prepared.getValue();
+   }
    preparationSockets=protectedSockets.get()-beforePreparation;
    if(stopRequested)throw new java.io.InterruptedIOException("Stopped");
    if(settingUp){
@@ -290,24 +303,34 @@ public final class TunnelService extends VpnService {
    if(tunnel==null)throw new IllegalStateException("VPN permission revoked");
    setUnderlyingNetworks(new Network[]{captured});core.setTunFD(tunnel.getFd());
    sessionDNS=systemDNS.toString();sessionInterfaces=snapshots.toString();sessionInterface=nic.getName();sessionInterfaceIndex=nic.getIndex();
-   stage="启动数据面";core.startAndroidSession(profile,config,sessionDNS);
+   stage="启动数据面";
+   StartupResult started=core.startAndroidSessionResult(profile,config,sessionDNS);
+   if(!started.getMessage().isEmpty()){
+    attemptFailed(epoch,started.getRetryable(),"启动数据面失败");return;
+   }
    logTunnelOwnership("connected-ingress");
    if(stopRequested){state="未连接";finish();return;}
    awaitReady(epoch,profile,systemDNS.toString(),SystemClock.elapsedRealtime()+30000);
   }catch(Exception error){
    if(profileImport!=null){state="配置下载未完成，原配置保留";finish();return;}
-   stopCore();
-   if(stopRequested){state="未连接";finish();return;}
-   lifecycle.completeAttempt(epoch,false,error instanceof java.io.IOException,SystemClock.elapsedRealtime());
-   try{
-    JSONObject result=new JSONObject(lifecycle.snapshot());
-    if(result.getString("phase").equals("backoff")){
-     state="网络暂不可用，正在重试";
-     if(retry!=null)retry.cancel(false);
-     retry=worker.schedule(this::reconcile,Math.max(1,result.getLong("retry_at_ms")-SystemClock.elapsedRealtime()),TimeUnit.MILLISECONDS);
-    }else{state=stage+"失败（"+error.getClass().getSimpleName()+"）";finish();}
-   }catch(Exception ignored){finish();}
+   attemptFailed(epoch,error instanceof java.net.SocketException,stage+"失败（"+error.getClass().getSimpleName()+"）");
   }
+ }
+ private void attemptFailed(long epoch,boolean retryable,String message){
+  stopCore();
+  if(stopRequested){state="未连接";finish();return;}
+  lifecycle.completeAttempt(epoch,false,retryable,SystemClock.elapsedRealtime());
+  try{
+   JSONObject result=new JSONObject(lifecycle.snapshot());
+   String phase=result.getString("phase");
+   if(phase.equals("backoff")){
+    state="网络暂不可用，正在重试";
+    if(retry!=null)retry.cancel(false);
+    retry=worker.schedule(this::reconcile,Math.max(1,result.getLong("retry_at_ms")-SystemClock.elapsedRealtime()),TimeUnit.MILLISECONDS);
+   }else if(phase.equals("waiting_network")){
+    state="等待网络恢复";
+   }else{state=message;finish();}
+  }catch(JSONException invalid){state=message;finish();}
  }
  private void refreshTailscale(long epoch){
   if(core==null||!settingUp||coreEpoch!=epoch)return;
@@ -325,7 +348,7 @@ public final class TunnelService extends VpnService {
     probes.execute(()->{try{android.util.Log.i("XDialRuleRefresh",committed.refreshAndroidRuleSets(profile,systemDNS,base));}catch(Exception ignored){/* Valid cache and traffic remain usable. */}});
     return;
    }
-   if(SystemClock.elapsedRealtime()>=deadline)throw new java.io.IOException("Exit readiness timeout");
+   if(SystemClock.elapsedRealtime()>=deadline){attemptFailed(epoch,true,"出口连接超时");return;}
    state="正在验证出口连接";statusRefresh=worker.schedule(()->awaitReady(epoch,profile,systemDNS,deadline),1000,TimeUnit.MILLISECONDS);
   }catch(Exception error){state="出口未就绪，请检查 Tailscale 登录、授权和节点状态";finish();}
  }

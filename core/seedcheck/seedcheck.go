@@ -36,6 +36,30 @@ type Seed struct {
 	// shipped (rule_set_history). Apps update such a rule to the current
 	// content only while it still equals one of these.
 	RuleHistory map[string][]RuleContent
+	// ScenarioHistory: imported Scenario ID -> routing earlier revisions
+	// shipped (scenario_history), in imported line and rule IDs. Apps replace
+	// such a Scenario's routing only while it still equals one of these.
+	ScenarioHistory map[string][]ScenarioRouting
+}
+
+// sourceItem is the identity of a line, rule or Scenario as the seed file names it.
+type sourceItem struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// ScenarioRouting is the routing a preset revision shipped for a Scenario:
+// the default exit and the ordered rule bindings. Order counts, since the
+// first matching rule decides.
+type ScenarioRouting struct {
+	DefaultLineID string           `json:"default_line_id"`
+	Bindings      []RoutingBinding `json:"bindings"`
+}
+
+// RoutingBinding is one shipped rule binding of a ScenarioRouting.
+type RoutingBinding struct {
+	RuleSetID string `json:"rule_set_id"`
+	LineID    string `json:"line_id"`
 }
 
 // RuleContent is a manual rule's matching content; order and case do not count.
@@ -84,18 +108,15 @@ func Load(data []byte) (*Seed, error) {
 		Regions       map[string]string                       `json:"region_scenarios"`
 		Profile       json.RawMessage                         `json:"profile"`
 		RuleHistory   map[string][]map[string]json.RawMessage `json:"rule_set_history"`
+		ScenarioHist  map[string][]json.RawMessage            `json:"scenario_history"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil || envelope.SchemaVersion != 1 || envelope.Revision <= 0 {
 		return nil, fmt.Errorf("invalid mobile seed envelope")
 	}
 	var source struct {
-		Scenarios []struct {
-			ID string `json:"id"`
-		} `json:"scenarios"`
-		RuleSets []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
-		} `json:"rule_sets"`
+		Scenarios []sourceItem `json:"scenarios"`
+		RuleSets  []sourceItem `json:"rule_sets"`
+		Lines     []sourceItem `json:"lines"`
 	}
 	if err := json.Unmarshal(envelope.Profile, &source); err != nil {
 		return nil, fmt.Errorf("invalid seed profile")
@@ -175,7 +196,106 @@ func Load(data []byte) (*Seed, error) {
 			history[profile.RuleSets[index].ID] = append(history[profile.RuleSets[index].ID], content)
 		}
 	}
-	return &Seed{Profile: profile, Regions: regions, Revision: envelope.Revision, Mobile: true, RuleHistory: history}, nil
+	scenarioHistory, err := loadScenarioHistory(root, envelope.ScenarioHist, source.Scenarios, source.RuleSets, source.Lines, profile)
+	if err != nil {
+		return nil, err
+	}
+	return &Seed{Profile: profile, Regions: regions, Revision: envelope.Revision, Mobile: true,
+		RuleHistory: history, ScenarioHistory: scenarioHistory}, nil
+}
+
+// loadScenarioHistory validates scenario_history as strictly as the Apps do and
+// expresses it in the imported IDs, matched by position like the rest of the seed.
+func loadScenarioHistory(
+	root map[string]json.RawMessage, entries map[string][]json.RawMessage,
+	scenarios, rules, lines []sourceItem, profile *config.Profile,
+) (map[string][]ScenarioRouting, error) {
+	if raw, present := root["scenario_history"]; present && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, fmt.Errorf("scenario_history must be an object")
+	}
+	if len(entries) == 0 {
+		return map[string][]ScenarioRouting{}, nil
+	}
+	if len(rules) != len(profile.RuleSets) || len(lines) != len(profile.Lines) {
+		return nil, fmt.Errorf("seed lines or rule sets changed during import")
+	}
+	scenarioIDs, ruleIDs, lineIDs := map[string]string{}, map[string]string{}, map[string]string{}
+	for i, scenario := range scenarios {
+		scenarioIDs[scenario.ID] = profile.Scenarios[i].ID
+	}
+	for i, rule := range rules {
+		ruleIDs[rule.ID] = profile.RuleSets[i].ID
+	}
+	for i, line := range lines {
+		lineIDs[line.ID] = profile.Lines[i].ID
+	}
+	history := map[string][]ScenarioRouting{}
+	for scenarioID, versions := range entries {
+		target, ok := scenarioIDs[scenarioID]
+		if !ok {
+			return nil, fmt.Errorf("scenario_history names %s, which is not a Scenario of the preset", scenarioID)
+		}
+		if versions == nil {
+			return nil, fmt.Errorf("scenario_history for %s must be an array", scenarioID)
+		}
+		for _, raw := range versions {
+			routing, err := decodeScenarioRouting(raw)
+			if err != nil {
+				return nil, fmt.Errorf("scenario_history for %s: %v", scenarioID, err)
+			}
+			mapped := ScenarioRouting{DefaultLineID: lineIDs[routing.DefaultLineID], Bindings: []RoutingBinding{}}
+			if mapped.DefaultLineID == "" {
+				return nil, fmt.Errorf("scenario_history for %s names unknown line %s", scenarioID, routing.DefaultLineID)
+			}
+			for _, binding := range routing.Bindings {
+				rule, line := ruleIDs[binding.RuleSetID], lineIDs[binding.LineID]
+				if rule == "" || line == "" {
+					return nil, fmt.Errorf("scenario_history for %s binds unknown rule %s or line %s",
+						scenarioID, binding.RuleSetID, binding.LineID)
+				}
+				mapped.Bindings = append(mapped.Bindings, RoutingBinding{RuleSetID: rule, LineID: line})
+			}
+			history[target] = append(history[target], mapped)
+		}
+	}
+	return history, nil
+}
+
+// decodeScenarioRouting admits only default_line_id and bindings of
+// rule_set_id / line_id strings, rejecting nulls as the Apps do.
+func decodeScenarioRouting(raw json.RawMessage) (ScenarioRouting, error) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return ScenarioRouting{}, fmt.Errorf("each version must be an object")
+	}
+	var routing ScenarioRouting
+	for key, value := range object {
+		switch key {
+		case "default_line_id":
+			if json.Unmarshal(value, &routing.DefaultLineID) != nil || routing.DefaultLineID == "" {
+				return ScenarioRouting{}, fmt.Errorf("default_line_id must be a non-empty string")
+			}
+		case "bindings":
+			var bindings []map[string]json.RawMessage
+			if json.Unmarshal(value, &bindings) != nil || bindings == nil {
+				return ScenarioRouting{}, fmt.Errorf("bindings must be an array of objects")
+			}
+			for _, binding := range bindings {
+				var item RoutingBinding
+				if len(binding) != 2 || json.Unmarshal(binding["rule_set_id"], &item.RuleSetID) != nil ||
+					json.Unmarshal(binding["line_id"], &item.LineID) != nil || item.RuleSetID == "" || item.LineID == "" {
+					return ScenarioRouting{}, fmt.Errorf("each binding needs exactly rule_set_id and line_id strings")
+				}
+				routing.Bindings = append(routing.Bindings, item)
+			}
+		default:
+			return ScenarioRouting{}, fmt.Errorf("a version may only list default_line_id and bindings")
+		}
+	}
+	if routing.DefaultLineID == "" {
+		return ScenarioRouting{}, fmt.Errorf("default_line_id is required")
+	}
+	return routing, nil
 }
 
 // A shared preset may only use what the phone's importer reads the same way
@@ -444,7 +564,8 @@ func withoutSecrets(line config.Line) config.Line {
 
 // Fingerprint is the routing meaning of a seed. Map keys name the parts a
 // platform may declare as unsupported: "lines", "rule_sets", "scenarios",
-// "active_scenario", "regions", "offline_rules", "rule_set_history".
+// "active_scenario", "regions", "offline_rules", "rule_set_history",
+// "scenario_history".
 func Fingerprint(seed *Seed, offline map[string]string) map[string]any {
 	p := seed.Profile
 	var lines []map[string]any
@@ -495,9 +616,18 @@ func Fingerprint(seed *Seed, offline map[string]string) map[string]any {
 		}
 		ruleHistory[id] = sorted(keys)
 	}
+	scenarioHistory := map[string]any{}
+	for id, versions := range seed.ScenarioHistory {
+		keys := []string{}
+		for _, version := range versions {
+			data, _ := json.Marshal(version)
+			keys = append(keys, string(data))
+		}
+		scenarioHistory[id] = sorted(keys)
+	}
 	return canonical(map[string]any{"lines": lines, "rule_sets": rules, "scenarios": scenarios,
 		"active_scenario": p.ActiveScenarioID, "regions": regions, "offline_rules": offlineRules,
-		"rule_set_history": ruleHistory})
+		"rule_set_history": ruleHistory, "scenario_history": scenarioHistory})
 }
 
 // ruleFingerprint is everything a RuleSet matches on. Conditions keep their

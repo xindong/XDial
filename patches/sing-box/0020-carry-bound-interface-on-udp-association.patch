@@ -1,0 +1,276 @@
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -110,12 +110,21 @@
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	if h.xdialFlowMetadata {
++		boundMarker := isXDialBoundAssociationMarker(metadata.Destination)
+ 		encoded, err := applyXDialFlowMetadata(&metadata)
+ 		if encoded && err != nil {
+ 			N.CloseOnHandshakeFailure(conn, onClose, err)
+ 			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
+ 			return
+ 		}
++		if boundMarker {
++			conn, err = xdialAdoptBoundAssociation(conn, &metadata)
++			if err != nil {
++				N.CloseOnHandshakeFailure(conn, onClose, err)
++				h.logger.ErrorContext(ctx, "read first datagram after XDial bound marker")
++				return
++			}
++		}
+ 	}
+ 	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+--- /dev/null
++++ b/protocol/socks/xdial_bound_association.go
+@@ -0,0 +1,74 @@
++package socks
++
++import (
++	"bytes"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/bufio"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// SOCKS5 UDP ASSOCIATE gives the server no per-association metadata: the
++// sing server discards the request address and hands the destination of the
++// first datagram to the handler. The XDial loopback relay therefore opens a
++// bound association with one placeholder marker datagram whose destination is the
++// bound-interface envelope. The handler reads the interface from that first
++// destination (applyXDialFlowMetadata) and this filter keeps every marker out
++// of routing, so DNS forwarding and Direct dialing see the interface macOS
++// bound the application socket to. The association destination then becomes
++// the first real datagram's destination, exactly as without the marker.
++func isXDialBoundAssociationMarker(destination M.Socksaddr) bool {
++	return destination.IsDomain() &&
++		bytes.HasPrefix([]byte(destination.Fqdn), xdialBoundFlowMetadataMagic)
++}
++
++type xdialBoundMarkerFilterConn struct {
++	N.PacketConn
++}
++
++func newXDialBoundMarkerFilterConn(conn N.PacketConn) N.PacketConn {
++	return &xdialBoundMarkerFilterConn{PacketConn: conn}
++}
++
++// ReadPacket drops markers in place. The caller sized the buffer's front and
++// rear headroom for its writer, so a dropped marker restores that layout
++// instead of resetting the buffer to zero headroom.
++func (c *xdialBoundMarkerFilterConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	start, length, capacity := buffer.Start(), buffer.Len(), buffer.Cap()
++	for {
++		destination, err := c.PacketConn.ReadPacket(buffer)
++		if err != nil || !isXDialBoundAssociationMarker(destination) {
++			return destination, err
++		}
++		buffer.Reset()
++		buffer.Reserve(buffer.RawCap() - capacity)
++		buffer.Resize(start, length)
++	}
++}
++
++// Upstream exposes the SOCKS association to headroom calculation. Replies are
++// written through AssociatePacketConn, which prepends the SOCKS UDP header
++// into the buffer's front headroom; hiding it leaves zero headroom and the
++// first reply on a bound association panics. The filter is not
++// ReaderReplaceable, so packet copying still reads through it.
++func (c *xdialBoundMarkerFilterConn) Upstream() any {
++	return c.PacketConn
++}
++
++// xdialAdoptBoundAssociation runs after applyXDialFlowMetadata consumed the
++// marker destination. It reads past every marker to the first real datagram,
++// restores that datagram as the association destination and keeps it cached
++// for routing and sniffing.
++func xdialAdoptBoundAssociation(conn N.PacketConn, metadata *adapter.InboundContext) (N.PacketConn, error) {
++	filtered := newXDialBoundMarkerFilterConn(conn)
++	packet := buf.NewPacket()
++	destination, err := filtered.ReadPacket(packet)
++	if err != nil {
++		packet.Release()
++		return conn, err
++	}
++	metadata.Destination = destination
++	return bufio.NewCachedPacketConn(filtered, packet, destination), nil
++}
+--- /dev/null
++++ b/protocol/socks/xdial_bound_association_test.go
+@@ -0,0 +1,172 @@
++package socks
++
++import (
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/bufio"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/protocol/socks"
++
++	"github.com/stretchr/testify/require"
++)
++
++type xdialQueuedPacketConn struct {
++	packets []xdialQueuedPacket
++}
++
++type xdialQueuedPacket struct {
++	destination M.Socksaddr
++	payload     []byte
++}
++
++func (c *xdialQueuedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	if len(c.packets) == 0 {
++		return M.Socksaddr{}, net.ErrClosed
++	}
++	packet := c.packets[0]
++	c.packets = c.packets[1:]
++	_, _ = buffer.Write(packet.payload)
++	return packet.destination, nil
++}
++
++func (c *xdialQueuedPacketConn) WritePacket(*buf.Buffer, M.Socksaddr) error { return nil }
++func (c *xdialQueuedPacketConn) Close() error                            { return nil }
++func (c *xdialQueuedPacketConn) LocalAddr() net.Addr                     { return nil }
++func (c *xdialQueuedPacketConn) SetDeadline(time.Time) error             { return nil }
++func (c *xdialQueuedPacketConn) SetReadDeadline(time.Time) error         { return nil }
++func (c *xdialQueuedPacketConn) SetWriteDeadline(time.Time) error        { return nil }
++
++func xdialBoundMarkerDestination(interfaceName string) M.Socksaddr {
++	raw := append([]byte(nil), xdialBoundFlowMetadataMagic...)
++	raw = append(raw, xdialBoundInterfaceFlag, byte(len(interfaceName)))
++	raw = append(raw, interfaceName...)
++	return M.Socksaddr{Fqdn: string(raw)}
++}
++
++func TestXDialBoundAssociationMarkerCarriesInterfaceAndNeverRoutes(t *testing.T) {
++	marker := xdialBoundMarkerDestination("utun16")
++	metadata := adapter.InboundContext{Destination: marker}
++	require.True(t, isXDialBoundAssociationMarker(metadata.Destination))
++	encoded, err := applyXDialFlowMetadata(&metadata)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "utun16", metadata.XDialBoundInterface)
++	require.False(t, metadata.Destination.IsValid())
++
++	// sing 已经把首个数据报（标记包）作为目标交出，连接里剩下的是后续数据报。
++	resolver := M.SocksaddrFrom(netip.MustParseAddr("100.100.100.100"), 53)
++	conn, err := xdialAdoptBoundAssociation(&xdialQueuedPacketConn{packets: []xdialQueuedPacket{
++		{destination: marker, payload: []byte{0}},
++		{destination: resolver, payload: []byte{1, 2}},
++		{destination: marker, payload: []byte{0}},
++		{destination: resolver, payload: []byte{3}},
++	}}, &metadata)
++	require.NoError(t, err)
++	require.Equal(t, resolver, metadata.Destination)
++	require.Equal(t, "utun16", metadata.XDialBoundInterface)
++	for _, want := range [][]byte{{1, 2}, {3}} {
++		buffer := buf.NewPacket()
++		destination, err := conn.ReadPacket(buffer)
++		require.NoError(t, err)
++		require.Equal(t, resolver, destination)
++		require.Equal(t, want, buffer.Bytes())
++		buffer.Release()
++	}
++}
++
++func TestXDialBoundAssociationMarkerIgnoresOrdinaryDestinations(t *testing.T) {
++	require.False(t, isXDialBoundAssociationMarker(M.ParseSocksaddrHostPort("example.com", 53)))
++	require.False(t, isXDialBoundAssociationMarker(M.SocksaddrFrom(netip.MustParseAddr("192.0.2.1"), 53)))
++}
++
++func TestXDialBoundAssociationReplyKeepsSOCKSHeadroom(t *testing.T) {
++	server, err := net.ListenPacket("udp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer server.Close()
++	client, err := net.ListenPacket("udp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer client.Close()
++	control, peer := net.Pipe()
++	defer control.Close()
++	defer peer.Close()
++
++	// 与 sing SOCKS 服务端相同的组装：关联连接 + 以标记包为首包的缓存连接。
++	association := socks.NewAssociatePacketConn(bufio.NewServerPacketConn(server), M.Socksaddr{}, control)
++	marker := xdialBoundMarkerDestination("en1")
++	router := M.SocksaddrFrom(netip.MustParseAddr("192.168.68.1"), 5351)
++	sendSOCKSDatagram := func(destination M.Socksaddr, payload []byte) {
++		datagram := buf.NewPacket()
++		defer datagram.Release()
++		common.Must(datagram.WriteZeroN(3))
++		require.NoError(t, M.SocksaddrSerializer.WriteAddrPort(datagram, destination))
++		_, _ = datagram.Write(payload)
++		_, err := client.WriteTo(datagram.Bytes(), server.LocalAddr())
++		require.NoError(t, err)
++	}
++	deadline := time.Now().Add(5 * time.Second)
++	require.NoError(t, server.SetDeadline(deadline))
++	require.NoError(t, client.SetDeadline(deadline))
++
++	sendSOCKSDatagram(marker, []byte{0})
++	sendSOCKSDatagram(router, []byte{0, 0})
++
++	firstPacket := buf.NewPacket()
++	firstDestination, err := association.ReadPacket(firstPacket)
++	require.NoError(t, err)
++	cached := bufio.NewCachedPacketConn(association, firstPacket, firstDestination)
++	metadata := adapter.InboundContext{Destination: firstDestination}
++	_, err = applyXDialFlowMetadata(&metadata)
++	require.NoError(t, err)
++	conn, err := xdialAdoptBoundAssociation(cached, &metadata)
++	require.NoError(t, err)
++	require.Equal(t, router, metadata.Destination)
++	require.Equal(t, "en1", metadata.XDialBoundInterface)
++
++	// 回包按复制循环的方式分配头部预留，再经 SOCKS 关联写回 App。
++	headroom := N.CalculateFrontHeadroom(conn)
++	require.Equal(t, association.FrontHeadroom(), headroom)
++	reply := buf.NewPacket()
++	reply.Resize(headroom, 0)
++	_, _ = reply.Write([]byte{0, 128, 0, 0})
++	require.NotPanics(t, func() {
++		require.NoError(t, conn.WritePacket(reply, router))
++	})
++
++	received := make([]byte, 64)
++	n, _, err := client.ReadFrom(received)
++	require.NoError(t, err)
++	replyBuffer := buf.As(received[:n])
++	replyBuffer.Advance(3)
++	destination, err := M.SocksaddrSerializer.ReadAddrPort(replyBuffer)
++	require.NoError(t, err)
++	require.Equal(t, router, destination)
++	require.Equal(t, []byte{0, 128, 0, 0}, replyBuffer.Bytes())
++}
++
++func TestXDialBoundMarkerFilterKeepsCallerHeadroom(t *testing.T) {
++	marker := xdialBoundMarkerDestination("en1")
++	router := M.SocksaddrFrom(netip.MustParseAddr("192.168.68.1"), 5351)
++	conn := newXDialBoundMarkerFilterConn(&xdialQueuedPacketConn{packets: []xdialQueuedPacket{
++		{destination: marker, payload: []byte{0}},
++		{destination: router, payload: []byte{7}},
++	}})
++	buffer := buf.NewPacket()
++	defer buffer.Release()
++	buffer.Resize(64, 0)
++	buffer.Reserve(16)
++	capacity := buffer.Cap()
++
++	destination, err := conn.ReadPacket(buffer)
++	require.NoError(t, err)
++	require.Equal(t, router, destination)
++	require.Equal(t, 64, buffer.Start())
++	require.Equal(t, capacity, buffer.Cap())
++	require.Equal(t, []byte{7}, buffer.Bytes())
++}

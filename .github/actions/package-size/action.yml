@@ -1,0 +1,48 @@
+name: Report package size
+description: Measure build products and compare to the PR base when measurements exist.
+inputs:
+  group:
+    required: true
+    description: Stable report identifier
+  paths:
+    required: true
+    description: One product path per line
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SIZE_GROUP: ${{ inputs.group }}
+        PRODUCTS: ${{ inputs.paths }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        out="build/size-reports/$SIZE_GROUP"
+        mkdir -p "$out"
+        if [[ -n "$BASE_SHA" && "$BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+          if ! run=$(gh run list --workflow ci.yml --event push --commit "$BASE_SHA" --limit 10 --json databaseId,headBranch \
+            --jq 'map(select(.headBranch=="main" or .headBranch=="xdial-beta")) | first | .databaseId // empty'); then
+            run=""
+            echo "Base report lookup unavailable"
+          fi
+          if [[ -n "$run" ]]; then
+            gh run download "$run" -n "sizes-$SIZE_GROUP" -D "$out/base" || { echo "Base report unavailable"; rm -rf "$out/base"; }
+          fi
+        fi
+        paths=()
+        while IFS= read -r path; do
+          [[ -z "$path" ]] || paths+=("$path")
+        done <<< "$PRODUCTS"
+        if [[ -f "$out/base/report.json" ]]; then
+          echo "Compared with \`$BASE_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "First measurement or base report unavailable." >> "$GITHUB_STEP_SUMMARY"
+        fi
+        python3 scripts/package-size.py --output "$out/report.json" --baseline "$out/base/report.json" \
+          "${paths[@]}" >> "$GITHUB_STEP_SUMMARY"
+    - uses: actions/upload-artifact@v7.0.2
+      with:
+        name: sizes-${{ inputs.group }}
+        path: build/size-reports/${{ inputs.group }}/report.json
+        if-no-files-found: error

@@ -14,6 +14,11 @@ struct ConnectionNoticeSettings: View {
     let chinese: Bool
     @AppStorage(ConnectionNotice.disconnect.preferenceKey, store: ConnectionNotice.preferences) private var disconnect = false
     @AppStorage(ConnectionNotice.scenario.preferenceKey, store: ConnectionNotice.preferences) private var scenario = false
+    #if os(macOS)
+    @AppStorage(ConnectionNotice.networkPreferenceKey, store: ConnectionNotice.preferences) private var network = false
+    #else
+    private let network = false
+    #endif
     @Environment(\.scenePhase) private var scenePhase
     @State private var denied = false
     @State private var requestFailed = false
@@ -26,7 +31,11 @@ struct ConnectionNoticeSettings: View {
             .onChange(of: disconnect) { _, enabled in if enabled { requestPermission() } }
         Toggle(chinese ? "场景切换时通知" : "Notify on scenario change", isOn: $scenario)
             .onChange(of: scenario) { _, enabled in if enabled { requestPermission() } }
-        if disconnect || scenario {
+        #if os(macOS)
+        Toggle(chinese ? "网络变化时通知" : "Notify on network change", isOn: $network)
+            .onChange(of: network) { _, enabled in if enabled { requestPermission() } }
+        #endif
+        if disconnect || scenario || network {
             if denied {
                 Text(chinese ? "请在系统通知设置中允许 XDial 发送通知。" : "Allow XDial in system notification settings.")
                     .font(.footnote)

@@ -3,6 +3,7 @@ package libbox
 import (
 	"context"
 	"fmt"
+
 	"net"
 	"net/url"
 	"strings"
@@ -43,7 +44,7 @@ func resolveServerIPv4(ctx context.Context, resolver serverIPResolver, server st
 
 	addresses, err := resolver.LookupIP(ctx, "ip4", host)
 	if err != nil {
-		return "", fmt.Errorf("server IPv4 lookup failed")
+		return "", redactedFailure{"server IPv4 lookup failed", err}
 	}
 	for _, address := range addresses {
 		if ipv4 := address.To4(); ipv4 != nil {
@@ -82,4 +83,8 @@ func serverHostname(server string) (string, error) {
 		return "", fmt.Errorf("server endpoint is invalid")
 	}
 	return raw, nil
+}
+
+func ResolveVPNServer(server string) *StartupResult {
+	return startupResult(ResolveServerIPv4(server))
 }

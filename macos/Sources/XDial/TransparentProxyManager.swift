@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import Libbox
 import Network
+import OSLog
 @preconcurrency import NetworkExtension
 import SystemConfiguration
 @preconcurrency import SystemExtensions
@@ -93,6 +94,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         ((Result<Void, Error>) -> Void)?
     private var startAttempt: NetworkExtensionStartAttempt?
     private var startIntentID: UUID?
+    /// The transaction an explicit `stop()` withdrew; its disconnect is not
+    /// a session loss even if the journal still reads committed.
+    private var explicitlyStoppedTransactionID: String?
     private var currentTransactionID: String?
     /// Transactions this Host process began or adopted. Only transactions
     /// outside this set can be leftovers of an earlier Host process.
@@ -117,7 +121,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     /// classification still follow the code in its report.
     private var budgetStoppedTransactionID: String?
     private let automaticReconnectRetryPolicy =
-        AutomaticReconnectRetryPolicy()
+        AutomaticReconnectRetryPolicy(delays: (0..<Int(LibboxConnectionRetryLimit)).map {
+            TimeInterval(LibboxConnectionRetrySeconds($0))
+        })
     /// Full-recovery budgets keyed by recovery epoch, parking, grants and
     /// the slow tail. The manager owns its timers and Underlay snapshots.
     private lazy var automaticRecoveryLedger = AutomaticRecoveryLedger(
@@ -323,7 +329,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
         automaticReconnectAttemptKind = nil
-        pendingInitialRetryTrigger = automaticRetryTrigger
+        pendingInitialRetryTrigger = automaticRetryTrigger ?? .userConnection
         automaticReconnectTransactionID = nil
         automaticReconnectUnderlayWaitEvidence = nil
         connectedSessionTransactionID = nil
@@ -347,25 +353,19 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     $0.updateTask(id: "underlay:system", state: .ready)
                     $0.setState(.preparing)
                 }
+                // resolver 一并记录：Underlay 的 DNS 必须是默认接口作用域的那一份。
+                // 一旦这里出现只在别的虚拟接口上可达的地址，本次事务里归直连
+                // 裁决的域名就会整片解析失败，而其它线路看起来完全正常。
                 appLog(
                     "Transparent Proxy underlay default=\(snapshot.defaultInterface.name)"
+                        + " dns=\(snapshot.systemDNSJSON)"
                 )
-                self.checkExtensionReadiness(purpose: .connection) {
-                    [weak self] result in
-                    guard let self else { return }
-                    guard self.startIntentID == intentID else { return }
-                    switch result {
-                    case .success:
-                        self.configureAndStart(
-                            profileJSON: profileJSON,
-                            underlay: snapshot,
-                            intentID: intentID,
-                            debugFailureStage: failureStage
-                        )
-                    case let .failure(error):
-                        self.publishFailure(error)
-                    }
-                }
+                self.checkReadinessAndConfigure(
+                    profileJSON: profileJSON,
+                    underlay: snapshot,
+                    intentID: intentID,
+                    debugFailureStage: failureStage
+                )
             case let .failure(error):
                 self.publishFailure(error)
             }
@@ -470,13 +470,21 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
+    private func logScenarioSwitchCancellation(
+        _ active: HostScenarioSwitch, reason: ScenarioSwitchCancellationReason
+    ) {
+        let logger = Logger(subsystem: XDialBuildIdentity.applicationIdentifier, category: "scenario-switch")
+        logger.notice("scenario-switch-cancel-request candidate=\(active.targetTransactionID, privacy: .public) reason=\(reason.rawValue, privacy: .public) automatic=\(active.networkEpochID != nil) sent=\(active.requestSent)")
+    }
+
     /// Cancellation is scoped to the staged switch. It must not stop the
     /// Network Extension session or alter the source transaction.
-    func cancelScenarioSwitch() {
+    func cancelScenarioSwitch(reason: ScenarioSwitchCancellationReason) {
         guard var active = activeScenarioSwitch,
               !active.cancellationRequested else {
             return
         }
+        logScenarioSwitchCancellation(active, reason: reason)
         if !active.requestSent {
             activeScenarioSwitch = nil
             active.timeoutWorkItem?.cancel()
@@ -485,11 +493,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 status: "cancelled",
                 activeTransactionID: active.sourceTransactionID,
                 code: "switch-cancelled",
-                message: ManagerError.scenarioSwitchCancelled
+                message: ProviderScenarioSwitchRejectedError.cancelled
                     .localizedDescription
             )
             active.completionGate.finish(.failure(
-                ManagerError.scenarioSwitchCancelled
+                ProviderScenarioSwitchRejectedError.cancelled
             ))
             return
         }
@@ -513,7 +521,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         // original response or the cancellation acknowledgement can be lost.
         beginScenarioSwitchReconciliation(
             requestID: request.requestID,
-            error: ManagerError.scenarioSwitchCancelled
+            error: ProviderScenarioSwitchRejectedError.cancelled
         )
     }
 
@@ -549,11 +557,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 status: "cancelled",
                 activeTransactionID: active.sourceTransactionID,
                 code: "switch-cancelled",
-                message: ManagerError.scenarioSwitchCancelled
+                message: ProviderScenarioSwitchRejectedError.cancelled
                     .localizedDescription
             )
             active.completionGate.finish(.failure(
-                ManagerError.scenarioSwitchCancelled
+                ProviderScenarioSwitchRejectedError.cancelled
             ))
             return
         }
@@ -672,6 +680,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         active.timeoutWorkItem?.cancel()
         active.timeoutWorkItem = nil
+        logScenarioSwitchCancellation(active, reason: .timeout)
         active.timedOut = true
         if !active.requestSent {
             activeScenarioSwitch = nil
@@ -962,7 +971,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     func stop() {
         if activeScenarioSwitch != nil {
-            cancelScenarioSwitch()
+            cancelScenarioSwitch(reason: .disconnected)
             if let active = activeScenarioSwitch {
                 activeScenarioSwitch = nil
                 active.timeoutWorkItem?.cancel()
@@ -972,10 +981,12 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     code: "user-disconnected", message: nil
                 )
                 active.completionGate.finish(.failure(
-                    ManagerError.scenarioSwitchCancelled
+                    ProviderScenarioSwitchRejectedError.cancelled
                 ))
             }
         }
+        explicitlyStoppedTransactionID = currentTransactionID
+            ?? ConnectionReportJournal.read()?.transactionID
         if let transactionID = currentTransactionID {
             updateReport(transactionID: transactionID) { report in
                 guard report.state != .committed else { return }
@@ -1354,6 +1365,30 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         completion?(result)
     }
 
+    /// Initial starts and recovery before a manager exists share the same
+    /// extension readiness and preferences preparation, including cancellation.
+    private func checkReadinessAndConfigure(
+        profileJSON: String,
+        underlay: HostUnderlaySnapshot,
+        intentID: UUID,
+        debugFailureStage: String?
+    ) {
+        checkExtensionReadiness(purpose: .connection) { [weak self] result in
+            guard let self, self.startIntentID == intentID else { return }
+            switch result {
+            case .success:
+                self.configureAndStart(
+                    profileJSON: profileJSON,
+                    underlay: underlay,
+                    intentID: intentID,
+                    debugFailureStage: debugFailureStage
+                )
+            case let .failure(error):
+                self.publishFailure(error)
+            }
+        }
+    }
+
     private func configureAndStart(
         profileJSON: String,
         underlay: HostUnderlaySnapshot,
@@ -1667,7 +1702,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                           !active.cancellationRequested,
                           !active.requestSent else {
                         completion(.failure(
-                            ManagerError.scenarioSwitchCancelled
+                            ProviderScenarioSwitchRejectedError.cancelled
                         ))
                         return
                     }
@@ -1758,7 +1793,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     code: active.timedOut
                         ? "switch-timeout"
                         : response.code ?? "switch-failed",
-                    message: response.message
+                    message: active.timedOut ? ManagerError.scenarioSwitchTimedOut.localizedDescription : response.message
                 )
                 return
             }
@@ -2015,17 +2050,17 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 return
             }
             let terminalError: Error
-            let code: String
+            let code = ProviderScenarioSwitchReconciliation
+                .sourceRestoredFailureCode(timedOut: active.timedOut)
             if active.timedOut {
                 terminalError = ManagerError.scenarioSwitchTimedOut
-                code = "switch-timeout"
-            } else if active.cancellationRequested {
-                terminalError = ManagerError.scenarioSwitchCancelled
-                code = "switch-cancelled"
             } else {
-                terminalError = active.reconciliationError
-                    ?? ManagerError.scenarioSwitchInvalidResponse
-                code = "switch-not-committed"
+                // Reconcile has no terminal failure code. A requested cancel
+                // may have raced a real failure whose response was lost.
+                terminalError = ProviderScenarioSwitchRejectedError(
+                    code: code,
+                    message: "未能确认场景切换结果，原连接仍在使用"
+                )
             }
             finishSourceScenarioSwitchFailure(
                 active,
@@ -2117,7 +2152,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         recordScenarioSwitch(
             active,
-            status: active.timedOut ? "timed-out" : "failed",
+            status: HostScenarioSwitchProjection.failureStatus(
+                code: code, cancellationRequested: active.cancellationRequested, timedOut: active.timedOut
+            ),
             activeTransactionID: active.sourceTransactionID,
             code: code,
             message: message
@@ -2540,27 +2577,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             cancelStableConnectionReset()
             stopUnderlayMonitoring()
             finishSystemDisconnectRollbackIfNeeded()
-            if let report = ConnectionReportJournal.read(),
-               report.state == .committed {
-                currentTransactionID = report.transactionID
-                finishInterruptedTransactionRecovery(
-                    transactionID: report.transactionID,
-                    error: .providerSessionLost,
-                    code: "provider-session-lost",
-                    taskID: "ingress:transparent-proxy"
-                )
-            }
-            if let report = ConnectionReportJournal.read(),
-               PersistedTransactionReconciliation.decide(
-                   report: report,
-                   ownership: ownership(of: report),
-                   systemSession: .inactive,
-                   hostIntentActive: hostIntentActive
-               ) == .finishWithdrawnTransaction {
-                finishWithdrawnTransaction(
-                    transactionID: report.transactionID
-                )
-            }
+            reconcilePersistedTransactionIfNeeded(
+                manager,
+                recoverInheritedTransaction: false
+            )
             if let transactionID = recoveringTransactionID {
                 recoveringTransactionID = nil
                 finishInterruptedTransactionRecovery(
@@ -2874,12 +2894,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         report: ConnectionReport?
     ) -> Bool {
         guard
-            pendingInitialRetryTrigger == .automaticConnection,
+            let trigger = pendingInitialRetryTrigger,
             let report,
             report.transactionID == currentTransactionID,
             report.state == .failed,
             report.rollbackComplete,
             report.systemTakeoverRemoved,
+            trigger != .userConnection || AutomaticReconnectFailurePolicy.isTransient(report.error),
             requestedProfileJSON != nil,
             startIntentID != nil
         else {
@@ -2887,9 +2908,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         pendingInitialRetryTrigger = nil
         automaticReconnectInProgress = true
-        automaticReconnectTrigger = .automaticConnection
+        automaticReconnectTrigger = trigger
         automaticReconnectAttemptKind = nil
-        // The failed launch transaction opens the episode and is awaited as
+        // The failed initial transaction opens the episode and is awaited as
         // its first outcome, but it is no attempt: it can never prove recovery.
         automaticReconnectTransactionID = nil
         automaticRecoveryOutcomeGate.await(report.transactionID)
@@ -2900,12 +2921,12 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             ),
             at: Date()
         )
-        let reasonCode = report.error?.code ?? "launch-auto-connect-failed"
+        let reasonCode = report.error?.code ?? "initial-connection-failed"
         let reasonMessage = report.error?.message
-            ?? "Launch auto-connect failed"
+            ?? "Initial connection failed"
         let incidentID = ReconnectIncidentJournal.begin(
             at: Date(),
-            trigger: .automaticConnection,
+            trigger: trigger,
             report: report,
             reasonCode: reasonCode,
             reasonMessage: reasonMessage
@@ -2914,7 +2935,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             ? nil
             : incidentID
         appLog(
-            "Transparent Proxy launch auto-connect failed "
+            "Transparent Proxy initial connection failed trigger=\(trigger.rawValue) "
                 + "transaction=\(report.transactionID) code="
                 + ReconnectIncidentFailureCode.recordable(reasonCode)
         )
@@ -3332,7 +3353,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     /// to the live state machine.
     @discardableResult
     private func reconcilePersistedTransactionIfNeeded(
-        _ manager: NETransparentProxyManager?
+        _ manager: NETransparentProxyManager?,
+        recoverInheritedTransaction: Bool = true
     ) -> Bool {
         guard let report = ConnectionReportJournal.read() else {
             return false
@@ -3341,7 +3363,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             report: report,
             ownership: ownership(of: report),
             systemSession: Self.systemSessionState(manager),
-            hostIntentActive: hostIntentActive
+            hostIntentActive: hostIntentActive,
+            explicitlyStoppedTransactionID: explicitlyStoppedTransactionID
         )
         switch disposition {
         case .none:
@@ -3359,11 +3382,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             )
             return false
         case .finishWithdrawnTransaction:
+            if report.state == .committed {
+                currentTransactionID = report.transactionID
+            }
             finishWithdrawnTransaction(
                 transactionID: report.transactionID
             )
             return false
         case let .recoverInterrupted(stopSystemSession):
+            guard recoverInheritedTransaction else { return false }
             currentTransactionID = report.transactionID
             guard stopSystemSession, let manager else {
                 finishInterruptedTransactionRecovery(
@@ -4376,7 +4403,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         guard
             currentTransactionID == failedTransactionID,
             requestedProfileJSON != nil,
-            let manager,
             startIntentID != nil
         else {
             abandonScheduledAttempt(scheduledKind)
@@ -4512,13 +4538,25 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                             + stableSnapshot.defaultInterface.name
                     )
                     self.publishRuntimeStatus("reconnecting", error: nil)
-                    self.startConnection(
-                        manager,
-                        profileJSON: prepared.profileJSON,
-                        underlay: stableSnapshot,
-                        intentID: intentID,
-                        debugFailureStage: nil
-                    )
+                    if let manager = self.manager {
+                        self.startConnection(
+                            manager,
+                            profileJSON: prepared.profileJSON,
+                            underlay: stableSnapshot,
+                            intentID: intentID,
+                            debugFailureStage: nil
+                        )
+                    } else {
+                        // Underlay capture may have failed before the first
+                        // manager was created. The attempt is already counted;
+                        // prepare it exactly like an initial connection.
+                        self.checkReadinessAndConfigure(
+                            profileJSON: prepared.profileJSON,
+                            underlay: stableSnapshot,
+                            intentID: intentID,
+                            debugFailureStage: nil
+                        )
+                    }
                 }
             case let .failure(error):
                 guard self.automaticReconnectPreparationGate
@@ -5034,7 +5072,9 @@ private final class HostUnderlayCapture {
                 )
             )
         }
-        guard let systemDNSJSON = Self.captureSystemDNSJSON() else {
+        guard let systemDNSJSON = Self.captureSystemDNSJSON(
+            interfaceName: defaultInterface.name
+        ) else {
             return HostUnderlaySnapshotEvaluation(
                 result: .failure(ManagerError.systemDNSUnavailable),
                 evidence: nil
@@ -5219,14 +5259,42 @@ private final class HostUnderlayCapture {
         }
     }
 
-    fileprivate static func captureSystemDNSJSON() -> String? {
+    /// Underlay 的 resolver 是**启动前默认接口作用域**的那一份，不是
+    /// `State:/Network/Global/DNS`。全局 DNS 可以被另一个虚拟网络接管——
+    /// 例如 Tailscale MagicDNS 会把它改写成只在自己的 utun 上可达的
+    /// 100.100.100.100。XDial 不识别网络产品，但一旦把这种地址当成 Underlay
+    /// 的系统 DNS，凡是本次事务没有承载那个虚拟接口的场景，归直连裁决的域名
+    /// 就会全部解析进黑洞，而走其它线路解析的域名看起来一切正常。
+    ///
+    /// `interfaceName` 是本次快照已经选定的默认接口。只有它确实是系统主接口时
+    /// 才取对应服务的作用域 resolver；其余情况退回全局 DNS，保持既有行为。
+    fileprivate static func captureSystemDNSJSON(
+        interfaceName: String? = nil
+    ) -> String? {
+        let globalIPv4 = SCDynamicStoreCopyValue(
+            nil,
+            "State:/Network/Global/IPv4" as CFString
+        ) as? [String: Any]
+        let primaryService =
+            globalIPv4?[kSCDynamicStorePropNetPrimaryService as String]
+                as? String
         guard
-            let state = SCDynamicStoreCopyValue(
-                nil,
-                "State:/Network/Global/DNS" as CFString
-            ) as? [String: Any],
-            let rawAddresses =
-                state[kSCPropNetDNSServerAddresses as String] as? [String]
+            let rawAddresses = UnderlayResolverSelection.serverAddresses(
+                interfaceName: interfaceName,
+                primaryInterface:
+                    globalIPv4?[
+                        kSCDynamicStorePropNetPrimaryInterface as String
+                    ] as? String,
+                primaryService: primaryService,
+                scopedAddresses: primaryService.flatMap {
+                    dnsServerAddresses(
+                        atKey: "State:/Network/Service/\($0)/DNS"
+                    )
+                },
+                globalAddresses: dnsServerAddresses(
+                    atKey: "State:/Network/Global/DNS"
+                )
+            )
         else {
             return nil
         }
@@ -5252,6 +5320,19 @@ private final class HostUnderlayCapture {
             return nil
         }
         return json
+    }
+
+    private static func dnsServerAddresses(atKey key: String) -> [String]? {
+        guard
+            let state = SCDynamicStoreCopyValue(nil, key as CFString)
+                as? [String: Any],
+            let addresses =
+                state[kSCPropNetDNSServerAddresses as String] as? [String],
+            !addresses.isEmpty
+        else {
+            return nil
+        }
+        return addresses
     }
 
     private static func isNumericIPAddress(_ address: String) -> Bool {
@@ -5368,7 +5449,12 @@ private final class HostUnderlayMonitor {
             "State:/Network/Global/IPv6",
             "State:/Network/Global/DNS",
         ] as CFArray
-        let patterns = ["State:/Network/Interface/[^/]+/IPv4"] as CFArray
+        // 快照的 resolver 取自默认接口所属服务的作用域 DNS。全局 DNS 被
+        // MagicDNS 这类虚拟网络接管时，DHCP 只改这一层而全局键不变，必须单独监听。
+        let patterns = [
+            "State:/Network/Interface/[^/]+/IPv4",
+            "State:/Network/Service/[^/]+/DNS",
+        ] as CFArray
         guard
             SCDynamicStoreSetNotificationKeys(store, keys, patterns),
             SCDynamicStoreSetDispatchQueue(store, .main)
@@ -5654,7 +5740,6 @@ private enum ManagerError: LocalizedError {
     case scenarioSwitchUnavailable
     case scenarioSwitchInvalidResponse
     case scenarioSwitchSendFailed
-    case scenarioSwitchCancelled
     case scenarioSwitchTimedOut
     case interruptedTransactionRecovered
     case providerSessionLost
@@ -5687,8 +5772,6 @@ private enum ManagerError: LocalizedError {
             "XDial Provider 返回了无效的场景切换结果"
         case .scenarioSwitchSendFailed:
             "无法向 XDial Provider 发送场景切换请求"
-        case .scenarioSwitchCancelled:
-            "场景切换已取消"
         case .scenarioSwitchTimedOut:
             "场景切换准备超时，当前场景保持连接"
         case .interruptedTransactionRecovered:

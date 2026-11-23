@@ -12,6 +12,7 @@ private struct PolicyMapping: Identifiable {
 private struct FailurePresentation {
     let title: String
     let detail: String?
+    var collapsesDetail = false
 }
 
 struct MainPopover: View {
@@ -378,8 +379,7 @@ struct MainPopover: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(state.surveyingRegion && !state.isBusy && !state.isConnected
-                         ? state.tr("正在选择场景…", "Choosing a scenario…") : (state.isBusy ? dialActivityTitle : state.statusText))
+                    Text(dialTitle)
                         .font(.system(.title, design: .rounded, weight: .bold))
                         .foregroundStyle(.white)
                         .fixedSize(horizontal: false, vertical: true)
@@ -405,7 +405,7 @@ struct MainPopover: View {
                 .disabled(state.engine.status == "disconnecting" || (state.surveyingRegion && !state.isConnected && !state.isBusy) ||
                           (state.activeScenario == nil && !state.isBusy && !state.isConnected))
                 .accessibilityLabel(dialActionTitle)
-                .accessibilityValue(state.statusText)
+                .accessibilityValue(dialTitle)
                 .help(dialActionTitle)
             }
             .padding(.horizontal, 17)
@@ -490,12 +490,26 @@ struct MainPopover: View {
         .padding(.bottom, 14)
     }
 
+    private var dialTitle: String {
+        if state.surveyingRegion && !state.isBusy && !state.isConnected {
+            return state.tr("正在选择场景…", "Choosing a scenario…")
+        }
+        if state.isBusy { return dialActivityTitle }
+        if AnyConnectLoginFailure(message: state.statusText) != nil {
+            return state.tr("VPN 连接失败", "VPN connection failed")
+        }
+        return state.statusText
+    }
+
     private var dialHint: String {
         if state.engine.status == "disconnecting" { return state.tr("正在结束连接", "Finishing the connection") }
         if state.isBusy || state.scenarioSwitchTargetID != nil { return state.tr("点按拨盘取消", "Click the dial to cancel") }
         if state.isConnected { return state.tr("点按拨盘断开", "Click the dial to disconnect") }
         if state.surveyingRegion { return state.tr("正在检查网络出口", "Checking the network exit") }
         if state.activeScenario == nil { return state.tr("请先添加场景", "Add a scenario to connect") }
+        if AnyConnectLoginFailure(message: state.statusText) != nil {
+            return state.tr("点拨盘重新登录", "Click the dial to sign in again")
+        }
         return state.tr("点按拨盘连接", "Click the dial to connect")
     }
 
@@ -820,6 +834,9 @@ struct MainPopover: View {
         let targetName = projection.candidateReport.scenario.name.isEmpty
             ? scenarioName(for: projection.toScenarioID)
             : projection.candidateReport.scenario.name
+        let title = projection.fromScenarioID == projection.toScenarioID
+            ? state.tr("刷新“\(sourceName)”失败，原连接仍在使用", "Couldn’t refresh “\(sourceName)”. The existing connection is still active.")
+            : state.tr("切换到“\(targetName)”失败，仍在使用“\(sourceName)”", "Couldn’t switch to “\(targetName)”; still using “\(sourceName)”")
         let detail = scenarioSwitchFailureDetail(projection)
         return HStack(alignment: .top, spacing: 9) {
             Image(systemName: "exclamationmark.circle.fill")
@@ -827,12 +844,7 @@ struct MainPopover: View {
                 .foregroundStyle(dangerColor)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 4) {
-                Text(
-                    state.tr(
-                        "切换到“\(targetName)”失败，仍在使用“\(sourceName)”",
-                        "Couldn’t switch to “\(targetName)”; still using “\(sourceName)”"
-                    )
-                )
+                Text(title)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.primary.opacity(0.88))
                 .fixedSize(horizontal: false, vertical: true)
@@ -1173,6 +1185,7 @@ struct MainPopover: View {
         let failure = failurePresentation(report)
         return VStack(spacing: 0) {
             failureBlock(failure)
+                .id(report.transactionID)
             Divider().padding(.leading, 24)
 
             let ingress = report.tasks.first { $0.kind == "ingress" }
@@ -1209,11 +1222,16 @@ struct MainPopover: View {
                     .font(.system(size: 12.5, weight: .semibold))
                     .fixedSize(horizontal: false, vertical: true)
                 if let detail = failure.detail, !detail.isEmpty {
-                    Text(detail)
+                    let message = Text(detail)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
+                    if failure.collapsesDetail {
+                        DisclosureGroup(state.tr("诊断详情", "Diagnostic details")) { message }
+                    } else {
+                        message
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1229,6 +1247,10 @@ struct MainPopover: View {
         let rawMessage = error?.message
             ?? state.engine.lastError
             ?? state.tr("连接失败", "Connection failed")
+        if let loginFailure = AnyConnectLoginFailure(message: rawMessage) {
+            return FailurePresentation(title: loginFailure.reason(tr: state.tr),
+                                       detail: rawMessage, collapsesDetail: true)
+        }
         let taskName = error.flatMap { failure in
             report.tasks.first { $0.id == failure.taskID }?.name
         }?.trimmingCharacters(in: .whitespacesAndNewlines)

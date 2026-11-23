@@ -21,12 +21,13 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/controlpipe"
 	"github.com/kafeifei/xdial/core/libbox"
 	"github.com/kafeifei/xdial/core/linuxcapture"
 	"github.com/kafeifei/xdial/core/linuxmaintenance"
 	"github.com/kafeifei/xdial/core/linuxresolver"
-	"github.com/kafeifei/xdial/core/mobile"
+	"github.com/kafeifei/xdial/core/recovery"
 	"golang.org/x/sys/unix"
 )
 
@@ -61,12 +62,14 @@ type Service struct {
 	core            *libbox.Libbox
 	resolver        *linuxresolver.Lease
 	capture         *linuxcapture.Session
-	controller      *mobile.ConnectionController
+	controller      *recovery.ConnectionController
 	revision        uint64
 	cleanupRequired bool
 	retired         *time.Timer
 	watcher         *fsnotify.Watcher
 	observer        sync.WaitGroup
+	profile         json.RawMessage // held only while the user wants this connection
+	retry           *time.Timer
 	underlay        string
 	networkFailed   bool
 	closeOnce       sync.Once
@@ -92,7 +95,7 @@ func Open(root string) (s *Service, err error) {
 	if err != nil {
 		return nil, err
 	}
-	s = &Service{root: root, lock: lock, gate: make(chan struct{}, 1), controller: mobile.NewConnectionController()}
+	s = &Service{root: root, lock: lock, gate: make(chan struct{}, 1), controller: recovery.NewConnectionController()}
 	s.gate <- struct{}{}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	nonce := make([]byte, 16)
@@ -253,30 +256,55 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 		}
 		return response("ok")
 	}
+	if req.Operation == "connect" && s.core == nil {
+		parsed, err := config.ParseRuntimeProfile(m.Profile)
+		if err != nil {
+			return response("invalid_profile_or_missing_cache")
+		}
+		if _, err = config.BuildConnectionPlan(parsed); err != nil {
+			return response("invalid_profile_or_missing_cache")
+		}
+		// An explicit retry supersedes a parked intent.
+		s.cancelRecovery()
+	}
+	code := s.apply(ctx, req.Operation, m.Profile)
+	if req.Operation == "connect" && s.core == nil && code != "waiting_network" {
+		s.cancelRecovery()
+	}
+	return response(code)
+}
+
+var serviceClock = time.Now()
+var errNoUnderlay = errors.New("no available underlay")
+var errUnderlayChanged = errors.New("underlay changed")
+
+// Caller holds gate; a resumed attempt passes the same admission, maintenance
+// and capture checks as a user request.
+func (s *Service) apply(ctx context.Context, operation string, profile json.RawMessage) string {
 	lease, err := linuxmaintenance.ConnectionLease(s.root)
 	if err != nil {
-		return response("maintenance_required")
+		return "maintenance_required"
 	}
 	defer lease.Close()
 	if s.networkFailed {
-		return response("network_observer_failed")
+		return "network_observer_failed"
 	}
 	if s.cleanupRequired {
-		return response("cleanup_required")
+		return "cleanup_required"
 	}
-	if (req.Operation == "connect") != (s.core == nil) {
-		return response("invalid_state")
+	if (operation == "connect") != (s.core == nil) {
+		return "invalid_state"
 	}
 	if err := s.watchResolver(); err != nil {
-		return response("unsupported_underlay")
+		return "unsupported_underlay"
 	}
 	if err := resolverIngressReady(); err != nil {
-		return response("unsupported_native_resolver_ingress")
+		return "unsupported_native_resolver_ingress"
 	}
 	if s.core == nil && usesResolvedStub() {
 		l, e := linuxresolver.Open(s.ctx)
 		if e != nil {
-			return response("unsupported_resolver_dependency")
+			return "unsupported_resolver_dependency"
 		}
 		s.resolver = l
 	}
@@ -288,24 +316,37 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 	}()
 	dns, interfaces, identity, err := s.networkFacts()
 	if err != nil {
-		return response("unsupported_underlay")
+		if operation == "connect" && errors.Is(err, errNoUnderlay) {
+			s.controller.RequestConnection(true)
+			s.controller.ObserveUnderlay("")
+			if s.profile == nil {
+				s.revision++
+			}
+			s.profile = profile
+			return "waiting_network"
+		}
+		return "unsupported_underlay"
 	}
 	var config string
 	if s.resolver != nil {
-		config, err = libbox.GenerateLinuxResolvedConfig(string(m.Profile), filepath.Join(s.root, "cache"), s.policy.Capture.BypassMark)
+		config, err = libbox.GenerateLinuxResolvedConfig(string(profile), filepath.Join(s.root, "cache"), s.policy.Capture.BypassMark)
 	} else {
-		config, err = libbox.GenerateLinuxConfig(string(m.Profile), dns, filepath.Join(s.root, "cache"), s.policy.Capture.BypassMark)
+		config, err = libbox.GenerateLinuxConfig(string(profile), dns, filepath.Join(s.root, "cache"), s.policy.Capture.BypassMark)
 	}
 	if err != nil {
-		return response("invalid_profile_or_missing_cache")
+		return "invalid_profile_or_missing_cache"
 	}
 	if err = ctx.Err(); err != nil {
-		return response("cancelled")
+		return "cancelled"
 	}
 	if s.core == nil {
 		s.controller.RequestConnection(true)
 		s.controller.ObserveUnderlay(identity)
-		epoch := s.controller.NextAttempt(time.Now().UnixMilli())
+		epoch := s.controller.NextAttempt(time.Since(serviceClock).Milliseconds())
+		if epoch == 0 {
+			return "waiting_network"
+		}
+		s.profile = profile
 		s.revision++
 		l := libbox.New(nil)
 		s.core = l
@@ -325,7 +366,7 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 			_, _, check, e := s.networkFacts()
 			err = e
 			if e == nil && check != identity {
-				err = errors.New("underlay changed")
+				err = errUnderlayChanged
 			}
 		}
 		if err == nil {
@@ -350,7 +391,6 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 			}
 		}
 		if err != nil {
-			s.controller.CompleteAttempt(epoch, false, false, 0)
 			if s.capture != nil {
 				if e := s.capture.Close(); e != nil {
 					s.cleanupRequired = true
@@ -361,12 +401,23 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 			if e := linuxcapture.Recover(filepath.Join(s.root, "capture")); e != nil {
 				s.cleanupRequired = true
 			}
-			return response(failureCode)
+			networkFailure := errors.Is(err, errUnderlayChanged) || errors.Is(err, errNoUnderlay) ||
+				(failureCode == "core_start_failed" && recovery.IsTransient(err))
+			retryable := networkFailure && !s.cleanupRequired && ctx.Err() == nil
+			now := time.Since(serviceClock).Milliseconds()
+			s.controller.CompleteAttempt(epoch, false, retryable, now)
+			if retryable {
+				if delay := s.controller.RetryAfter(now); delay >= 0 {
+					s.scheduleRetry(time.Duration(delay) * time.Millisecond)
+				}
+				return "waiting_network"
+			}
+			return failureCode
 		}
 		s.underlay = identity
 		s.controller.CompleteAttempt(epoch, true, false, 0)
 		s.observeResolverLease()
-		return response("ok")
+		return "ok"
 	}
 	// No two packet readers: libbox's stable listener admits a candidate without
 	// inbounds. Keep old flows for one second after the single DNS/route commit.
@@ -375,7 +426,7 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 		s.retired = nil
 	}
 	if err = s.core.RetireCommittedSwitch(); err != nil {
-		return response("switch_failed")
+		return "switch_failed"
 	}
 	if err = s.prepare(ctx, s.core, func() error { return s.core.PrepareSwitch(config, "", interfaces, "", -1) }); err == nil {
 		_, _, check, e := s.networkFacts()
@@ -395,8 +446,9 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 	}
 	if err != nil {
 		s.core.AbortPreparedSwitch()
-		return response("switch_failed")
+		return "switch_failed"
 	}
+	s.profile = profile
 	s.revision++
 	committedCore, committedRevision := s.core, s.revision
 	s.retired = time.AfterFunc(time.Second, func() {
@@ -410,7 +462,7 @@ func (s *Service) handle(ctx context.Context, _ controlpipe.UnixIdentity, req co
 			s.core.RetireCommittedSwitch()
 		}
 	})
-	return response("ok")
+	return "ok"
 }
 func (s *Service) stopCore() {
 	if s.core != nil {
@@ -422,8 +474,51 @@ func (s *Service) stopCore() {
 		s.resolver = nil
 	}
 }
-func (s *Service) disconnect() error {
+func (s *Service) cancelRecovery() {
 	s.controller.RequestConnection(false)
+	s.profile = nil
+	if s.retry != nil {
+		s.retry.Stop()
+		s.retry = nil
+	}
+}
+
+func (s *Service) resume() {
+	if s.core != nil || s.profile == nil || s.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 45*time.Second)
+	defer cancel()
+	switch s.apply(ctx, "connect", s.profile) {
+	case "ok", "waiting_network":
+	default:
+		s.cancelRecovery()
+	}
+}
+
+func (s *Service) scheduleRetry(delay time.Duration) {
+	if s.retry != nil {
+		s.retry.Stop()
+	}
+	revision := s.revision
+	s.retry = time.AfterFunc(delay, func() {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.gate:
+		}
+		defer func() { s.gate <- struct{}{} }()
+		if s.revision == revision {
+			s.resume()
+		}
+	})
+}
+
+func (s *Service) disconnect() error {
+	s.cancelRecovery()
+	return s.withdraw()
+}
+func (s *Service) withdraw() error {
 	if s.retired != nil {
 		s.retired.Stop()
 		s.retired = nil
@@ -478,6 +573,9 @@ func resolverAddress(b []byte) (string, error) {
 			return "", errors.New("native resolver backend required")
 		}
 		servers = append(servers, fields[1])
+	}
+	if len(servers) == 0 {
+		return "", errNoUnderlay
 	}
 	if len(servers) != 1 {
 		return "", errors.New("one captured resolver required")
@@ -559,6 +657,7 @@ func readNetworkFacts(resolved bool) (dns, interfaces, identity string, err erro
 		return
 	}
 	var facts []map[string]any
+	usableAddress := false
 	for _, i := range all {
 		a, e := i.Addrs()
 		if e != nil {
@@ -568,8 +667,15 @@ func readNetworkFacts(resolved bool) (dns, interfaces, identity string, err erro
 		addresses := make([]string, 0, len(a))
 		for _, v := range a {
 			addresses = append(addresses, v.String())
+			if ip, _, parseErr := net.ParseCIDR(v.String()); parseErr == nil && i.Flags&net.FlagUp != 0 && ip.IsGlobalUnicast() {
+				usableAddress = true
+			}
 		}
 		facts = append(facts, map[string]any{"name": i.Name, "index": i.Index, "type": "other", "facts": map[string]any{"mtu": i.MTU, "flags": uint32(i.Flags), "addresses": addresses}})
+	}
+	if !usableAddress {
+		err = errNoUnderlay
+		return
 	}
 	data, e := json.Marshal(facts)
 	if e != nil {

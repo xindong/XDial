@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -376,6 +377,7 @@ type networkReadinessVPNClient struct {
 	connects        int
 	fail            error
 	blockAfterFirst bool
+	connectDelay    time.Duration
 	entered         chan struct{}
 	release         chan struct{}
 	once            sync.Once
@@ -384,8 +386,9 @@ type networkReadinessVPNClient struct {
 func (c *networkReadinessVPNClient) Connect(engine.VPNConfig) (*engine.VPNInfo, error) {
 	c.mu.Lock()
 	c.connects++
-	count, fail := c.connects, c.fail
+	count, fail, delay := c.connects, c.fail, c.connectDelay
 	c.mu.Unlock()
+	time.Sleep(delay)
 	if c.blockAfterFirst && count > 1 {
 		c.once.Do(func() { close(c.entered) })
 		<-c.release
@@ -416,6 +419,108 @@ func (c *networkReadinessVPNClient) Disconnect() {
 	}
 }
 func (c *networkReadinessVPNClient) count() int { c.mu.Lock(); defer c.mu.Unlock(); return c.connects }
+
+func TestNetworkReadinessAnyConnectColdDialTimeout(t *testing.T) {
+	l := New(nil)
+	l.vpn = &networkReadinessVPNClient{fail: fmt.Errorf("AnyConnect connect: %w", context.DeadlineExceeded)}
+	defer l.Stop()
+	envelope := networkReadinessTestEnvelope(t, switchAnyConnectConfig, map[string]string{"company": "vpn"}, true)
+	err := l.StartForNetwork(envelope, networkReadinessTestContext("A"), "192.0.2.1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cold start returned %v", err)
+	}
+	var report lineReadinessReport
+	if err := json.Unmarshal([]byte(l.LineReadiness()), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.State != "failed" || report.Code != lineReadinessTransient {
+		t.Fatalf("dial timeout readiness = %+v", report)
+	}
+}
+
+// slowUnderlayProof authenticates only when the caller leaves it the time a
+// round trip on a slow Underlay takes; a shorter budget sees a transient failure.
+func slowUnderlayProof(roundTrip time.Duration) func(context.Context, adapter.Outbound) outboundTLSCapabilities {
+	return func(ctx context.Context, outbound adapter.Outbound) outboundTLSCapabilities {
+		timer := time.NewTimer(roundTrip)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return outboundTLSCapabilities{IPv4: outboundTLSFamilyCapability{FailureClass: lineReadinessTransient}}
+		case <-timer.C:
+			return successfulNetworkProof(ctx, outbound)
+		}
+	}
+}
+
+func shortenAnyConnectStaleProbeBudget(t *testing.T, budget time.Duration) {
+	t.Helper()
+	previous := anyConnectStaleProbeBudget
+	anyConnectStaleProbeBudget = budget
+	t.Cleanup(func() { anyConnectStaleProbeBudget = previous })
+}
+
+// Scaled down from the incident: a ~15 s AnyConnect login over a ~1 s RTT
+// Underlay, then a 2 s probe that expired, a forced reconnect, and a deadline
+// that ran out before the replacement session was proven.
+func TestNetworkReadinessSlowUnderlayKeepsFreshAnyConnectSession(t *testing.T) {
+	shortenAnyConnectStaleProbeBudget(t, 50*time.Millisecond)
+	vpn := &networkReadinessVPNClient{connectDelay: 400 * time.Millisecond}
+	l := New(nil)
+	l.vpn = vpn
+	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
+	defer l.Stop()
+	envelope := networkReadinessTestEnvelope(t, switchAnyConnectConfig, map[string]string{"company": "vpn"}, true)
+	if err := l.StartForNetwork(envelope, networkReadinessTestContext("A"), "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	c := l.activeAnyConnectCapability
+	if budget := c.readinessProbeBudget("A"); budget < 200*time.Millisecond {
+		t.Fatalf("session established on this network kept the stale budget: %v", budget)
+	}
+	l.probeOutboundTLSCapabilitiesFunc = slowUnderlayProof(120 * time.Millisecond)
+	if _, err := l.ProbeOutboundTLSCapabilities("vpn", 500); err != nil {
+		t.Fatalf("slow but working Underlay failed readiness: %v", err)
+	}
+	if vpn.count() != 1 {
+		t.Fatalf("working session was torn down and redialed: connects=%d", vpn.count())
+	}
+	if line := readinessLine(t, l, "company"); line.State != "ready" {
+		t.Fatalf("readiness = %+v", line)
+	}
+}
+
+func TestNetworkReadinessSessionFromEarlierNetworkKeepsStaleBudget(t *testing.T) {
+	shortenAnyConnectStaleProbeBudget(t, 50*time.Millisecond)
+	vpn := &networkReadinessVPNClient{connectDelay: 400 * time.Millisecond}
+	l := New(nil)
+	l.vpn = vpn
+	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
+	defer l.Stop()
+	envelope := networkReadinessTestEnvelope(t, switchAnyConnectConfig, map[string]string{"company": "vpn"}, true)
+	if err := l.StartForNetwork(envelope, networkReadinessTestContext("A"), "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.PrepareSwitchForNetwork(envelope, networkReadinessTestContext("B"), "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	c := l.activeAnyConnectCapability
+	if budget := c.readinessProbeBudget("B"); budget != anyConnectStaleProbeBudget {
+		t.Fatalf("handshake measured on an earlier network widened the budget: %v", budget)
+	}
+	// The short budget still exposes the old session; its replacement is
+	// measured on the new network and earns the wider budget there.
+	l.probeOutboundTLSCapabilitiesFunc = slowUnderlayProof(120 * time.Millisecond)
+	if _, err := l.ProbePreparedSwitchOutboundTLSCapabilities("vpn", 2000); err != nil {
+		t.Fatal(err)
+	}
+	if vpn.count() != 2 {
+		t.Fatalf("session from the earlier network was not replaced: connects=%d", vpn.count())
+	}
+	if budget := c.readinessProbeBudget("B"); budget < 200*time.Millisecond {
+		t.Fatalf("recovered session did not record its handshake: %v", budget)
+	}
+}
 
 func TestNetworkReadinessCandidateCancelPreservesOwnerRecovery(t *testing.T) {
 	vpn := &networkReadinessVPNClient{blockAfterFirst: true, entered: make(chan struct{}), release: make(chan struct{})}

@@ -105,7 +105,7 @@ targets:
         Release:
           INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: false
     dependencies:
-      - framework: ../build/frameworks/ios/Libbox.xcframework
+      - framework: ../build/shared/ios/Libbox.xcframework
         embed: false
       - sdk: libresolv.tbd
 
@@ -153,6 +153,7 @@ targets:
     sources:
       - path: ../apple/Home
       - path: ../apple/Notifications
+      - path: ../apple/CloudHost
       - path: XDialIOS
         excludes:
           - Info.plist
@@ -250,8 +251,8 @@ targets:
         embed: true
       - target: XDialIOSWidgets
         embed: true
-      - framework: ../build/frameworks/ios/Libbox.xcframework
-        embed: false
+      - framework: ../build/shared/ios/Libbox.xcframework
+        embed: true
       - sdk: libresolv.tbd
 
   XDialIOSTests:

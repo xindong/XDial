@@ -4,9 +4,11 @@ package libbox
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1911,6 +1913,45 @@ func TestSyncedTailscaleUsesSetupIdentityForTrafficAndColdRules(t *testing.T) {
 				releaseTailscaleStateLocks(locks)
 				if !errors.Is(err, errTailscaleStateInUse) {
 					t.Fatalf("setup lock bypassed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Both profile rules and compiler-generated rules must retain typed causes across
+// redaction and the mobile bridge. Invalid data and cancellation stay terminal.
+func TestRulePreparationPreservesRecoveryCauseWithoutLeakingResource(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+		retry bool
+	}{
+		{"timeout", context.DeadlineExceeded, true},
+		{"cancel", context.Canceled, false},
+		{"invalid", errors.New("invalid remote rule"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cause := &url.Error{Op: "Get", URL: "https://private.example/secret", Err: tc.cause}
+			fetch := func(string, int64) ([]byte, error) { return nil, cause }
+			profile := &config.Profile{
+				Lines:            []config.Line{{ID: "direct", Type: config.LineTypeDirect, Enabled: true}},
+				RuleSets:         []config.RuleSet{{ID: "remote", Type: config.RuleSetTypeURL, Enabled: true, URL: cause.URL, Format: "json"}},
+				Scenarios:        []config.Scenario{{ID: "s", DefaultLineID: "direct", Bindings: []config.RuleBinding{{RuleSetID: "remote", LineID: "direct"}}}},
+				ActiveScenarioID: "s",
+			}
+			profileErr := materializeNERuleSets(profile, t.TempDir(), fetch)
+			_, generatedErr := materializeGeneratedNERuleSets([]byte(`{"route":{"rule_set":[{"type":"remote","tag":"r","format":"source","url":"https://private.example/secret"}]}}`), t.TempDir(), fetch)
+			for _, err := range []error{profileErr, generatedErr} {
+				if err == nil || !errors.Is(err, tc.cause) {
+					t.Fatalf("lost cause: %v", err)
+				}
+				result := startupResult("", err)
+				if result.Retryable != tc.retry {
+					t.Fatalf("retryable=%v, want %v: %v", result.Retryable, tc.retry, err)
+				}
+				if strings.Contains(result.Message, "private.example") || strings.Contains(result.Message, "secret") {
+					t.Fatalf("leaked resource: %s", result.Message)
 				}
 			}
 		})

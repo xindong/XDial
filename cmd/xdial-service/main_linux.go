@@ -136,7 +136,7 @@ func run() error {
 	if e = json.NewEncoder(os.Stdout).Encode(response); e != nil {
 		return e
 	}
-	if response.Code != "ok" {
+	if response.Code != "ok" && response.Code != "waiting_network" {
 		return fmt.Errorf("%s", response.Code)
 	}
 	return nil

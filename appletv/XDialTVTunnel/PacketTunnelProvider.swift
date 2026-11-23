@@ -199,14 +199,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         os_log("startTunnel: begin", log: log, type: .info)
 
         // 1) 取凭据与 sing-box 配置。手动启动使用一次性 options；系统按需冷启动
-        //    没有 options，只允许读取双方共享 Keychain 中最近一次已验收的版本化启动包。
+        //    没有 options，只允许读取双方共享 Keychain 中本次连接意图的版本化启动包。
         guard let bundle = resolveStartBundle(options: options) else {
-            let err = providerError(2, "缺少完整且已验收的安全启动配置")
+            let err = providerError(2, "缺少完整的安全启动配置")
             failAttempt(generation, error: err, diagnosticStage: "start_bundle_missing")
             os_log("startTunnel: missing credentials/config", log: log, type: .error)
             return
         }
-        setSecureEnvelopeUsage(bundle.fromSecureEnvelope, generation: generation)
+        setSecureEnvelopeUsage(bundle.fromSecureEnvelope || (options?["onDemandEnvelopeSaved"] as? NSNumber)?.boolValue == true,
+                               generation: generation)
         setDiagnosticSensitiveValues(from: bundle)
         recordDiagnostic("start_bundle_loaded")
 
@@ -223,6 +224,51 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 self.recordDiagnostic("start_bundle_scenario_preferred")
             }
             #endif
+            // Complete cold-cache acquisition before installing any capture settings.
+            // The same secure intent lets the OS retry while the host is suspended.
+            guard self.isAttemptStarting(generation) else { return }
+            if !startBundle.preparationProfile.isEmpty {
+                guard startBundle.preparationProfile.utf8.count <= OnDemandStartEnvelope.maxConfigBytes else {
+                    self.failAttempt(generation, error: self.providerError(5, "连接配置过大"),
+                        diagnosticStage: "preparation_failed")
+                    return
+                }
+                let basePath = FileManager.default.containerURL(
+                    forSecurityApplicationGroupIdentifier: Self.appGroupID)?.path ?? ""
+                #if os(iOS)
+                let result = LibboxGenerateNESessionResult(startBundle.preparationProfile, startBundle.server, basePath)!
+                #else
+                let result = LibboxGenerateNEConfigResult(startBundle.preparationProfile, startBundle.server, basePath)!
+                #endif
+                guard self.isAttemptStarting(generation) else { return }
+                if !result.message.isEmpty {
+                    self.failAttempt(generation, error: self.providerError(5, result.message),
+                        diagnosticStage: result.retryable ? "preparation_network_unavailable" : "preparation_failed")
+                    return
+                }
+                #if os(iOS)
+                guard let data = result.value.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let config = object["config_json"] as? String else {
+                    self.failAttempt(generation, error: self.providerError(5, "连接配置无效"),
+                        diagnosticStage: "preparation_failed")
+                    return
+                }
+                startBundle.configJSON = config
+                if let line = object["anyconnect"] as? [String: Any] {
+                    startBundle.anyConnectLineID = line["line_id"] as? String ?? ""
+                    startBundle.anyConnectRuntimeIdentity = line["runtime_identity"] as? String ?? ""
+                }
+                #else
+                startBundle.configJSON = result.value
+                #endif
+                guard startBundle.configJSON.utf8.count <= OnDemandStartEnvelope.maxConfigBytes else {
+                    self.failAttempt(generation, error: self.providerError(5, "连接配置过大"),
+                        diagnosticStage: "preparation_failed")
+                    return
+                }
+                self.setDiagnosticSensitiveValues(from: startBundle)
+            }
             self.prepareAttempt(startBundle, generation: generation, completion: completion)
         }
     }
@@ -288,12 +334,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         //    也会作为 /32 排除路由和 sslcon 的 socket 目标。原始域名仍由 sslcon
         //    用作 TLS SNI/证书校验与 HTTP Host。
         recordDiagnostic("remote_address_resolving")
-        var resolveError: NSError?
-        let remoteIPv4 = LibboxResolveServerIPv4(bundle.server, &resolveError)
-        guard resolveError == nil, IPv4Address(remoteIPv4) != nil else {
-            let error = providerError(5, resolveError?.localizedDescription
-                ?? "服务器地址未解析为有效 IPv4")
-            failAttempt(generation, error: error, diagnosticStage: "remote_address_resolution_failed")
+        let resolution = LibboxResolveVPNServer(bundle.server)
+        let remoteIPv4 = resolution?.value ?? ""
+        guard IPv4Address(remoteIPv4) != nil else {
+            let error = providerError(5, resolution?.message ?? "服务器地址未解析为有效 IPv4")
+            let stage = resolution?.retryable == true ? "remote_address_lookup_unavailable" : "remote_address_resolution_failed"
+            failAttempt(generation, error: error, diagnosticStage: stage)
             os_log("startTunnel: remote address resolution failed",
                    log: log, type: .error)
             return
@@ -708,16 +754,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         lifecycleLock.unlock()
         networkSettingsSubmissionLock.unlock()
 
-        #if os(iOS)
         if OnDemandStartEnvelopeFailurePolicy.shouldClear(
             startedFromSecureEnvelope: clearSecureEnvelope,
             startupStage: diagnosticStage
         ) {
             _ = OnDemandStartEnvelopeStore.clear()
         }
-        #endif
         setLastError(error.localizedDescription)
         recordDiagnostic(diagnosticStage)
+        // iOS may terminate this extension immediately after the failure callback.
+        timeline?.flush()
         monitor?.cancel()
         completion?.finish(error)
     }
@@ -818,7 +864,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         let error = providerError(20 + code, detail)
         switch phase(for: generation) {
         case .starting:
-            failAttempt(generation, error: error, diagnosticStage: "engine_failed")
+            let stage = code == LibboxErrCodeTransientNetwork ? "engine_network_unavailable" : "engine_failed"
+            failAttempt(generation, error: error, diagnosticStage: stage)
         case .running:
             terminateRunningAttempt(generation, error: error)
         case .idle, nil:
@@ -1164,7 +1211,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         let username: String
         let password: String
         let allowInsecure: Bool
-        let configJSON: String
+        var configJSON: String
+        var preparationProfile = ""
         /// 以下字段来自新版 App；旧 App 的启动包没有，这时不能与切换候选共享线路。
         var scenarioID = ""
         var scenarioName = ""
@@ -1197,6 +1245,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         }
 
         mutating func readSwitchParameters(_ value: (String) -> String?) {
+            preparationProfile = value("preparation_profile") ?? ""
             scenarioID = value("scenario_id") ?? ""
             scenarioName = value("scenario_name") ?? ""
             anyConnectLineID = value("anyconnect_line_id") ?? ""
@@ -1283,14 +1332,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         // NetworkExtension 可能传入包含系统字段的非空 options。只要不满足主 App
         // 的完整手动契约，就必须按冷启动处理，不能误读为旧版手动启动。
         do {
-            #if os(iOS)
-            guard case .available(let envelope) = OnDemandStartEnvelopeStore.load() else {
-                return nil
+            recordTimeline("start_envelope_read")
+            switch OnDemandStartEnvelopeStore.load() {
+            case .available(let envelope):
+                let bundle = StartBundle.from(envelope: envelope, fromSecureEnvelope: true)
+                recordTimeline("start_envelope_decoded", result: bundle == nil ? .failed : .ok)
+                return bundle
+            case .missing:
+                recordTimeline("start_envelope_missing", result: .failed)
+            case .unavailable(let status):
+                recordTimeline("start_envelope_unavailable", result: .failed, detail: "keychain=\(status)")
+            case .corrupt:
+                recordTimeline("start_envelope_invalid", result: .failed)
             }
-            return StartBundle.from(envelope: envelope, fromSecureEnvelope: true)
-            #else
             return nil
-            #endif
         }
     }
 
@@ -1865,6 +1920,7 @@ extension PacketTunnelProvider {
         origin: TunnelScenarioState.SwitchRecord.Origin,
         expectedRevision: String?,
         reapply: Bool = false,
+        deadline: ScenarioSwitchDeadline = ScenarioSwitchDeadline(),
         decisionNetwork: String? = nil,
         automaticValidation: (@Sendable () -> Bool)? = nil,
         completion: @escaping @Sendable (Result<TunnelScenarioState, Error>) -> Void
@@ -1911,6 +1967,7 @@ extension PacketTunnelProvider {
                 to: scenarioID,
                 expectedRevision: expectedRevision,
                 generation: generation,
+                deadline: deadline,
                 automaticValidation: automaticValidation
             )
             let state = self.finishScenarioSwitch(
@@ -1992,9 +2049,11 @@ extension PacketTunnelProvider {
         to scenarioID: String,
         expectedRevision: String?,
         generation: UInt64,
+        deadline: ScenarioSwitchDeadline,
         automaticValidation: (@Sendable () -> Bool)?
     ) -> Result<ScenarioSwitchOutcome, Error> {
         dispatchPrecondition(condition: .onQueue(engineOperationQueue))
+        do { _ = try deadline.probeTimeoutMS() } catch { return .failure(error) }
         guard let engine = engine(for: generation), phase(for: generation) == .running else {
             return .failure(scenarioError("连接已结束"))
         }
@@ -2023,48 +2082,39 @@ extension PacketTunnelProvider {
             return .failure(scenarioError("自动判断已失效"))
         }
         let remoteChanges = targetRemote != sourceRemote
-        if remoteChanges, let error = applyRunningNetworkSettings(
-            buildNetworkSettings(remoteAddress: targetRemote, alsoExcluding: [sourceRemote]),
-            generation: generation
-        ) {
-            return .failure(error)
-        }
-
-        let staged = canStageScenarioSwitch(from: source, to: target)
-        let result: Result<TunnelScenarioState.SwitchRecord.Mode, Error>
-        if staged {
-            result = stagedScenarioSwitch(
-                engine, to: target, dialAddress: targetRemote, underlay: underlay, generation: generation,
-                automaticValidation: automaticValidation
-            ).map { .staged }
-        } else {
-            result = restartScenarioSwitch(
-                engine,
-                from: source, sourceDialAddress: sourceRemote,
-                to: target, targetDialAddress: targetRemote,
-                underlay: underlay, generation: generation,
-                automaticValidation: automaticValidation
-            ).map { .restart }
-        }
-
-        switch result {
-        case .success(let mode):
-            if remoteChanges {
-                // 收尾失败不影响新场景：多排除一条旧服务器路由没有害处。
-                _ = applyRunningNetworkSettings(
-                    buildNetworkSettings(remoteAddress: targetRemote),
-                    generation: generation
-                )
+        return ScenarioSwitchNetworkTransaction.run {
+            if remoteChanges, let error = applyRunningNetworkSettings(
+                buildNetworkSettings(remoteAddress: targetRemote, alsoExcluding: [sourceRemote]),
+                generation: generation
+            ) {
+                throw error
             }
-            return .success(ScenarioSwitchOutcome(bundle: target, remoteAddress: targetRemote, mode: mode))
-        case .failure(let error):
-            if remoteChanges, phase(for: generation) == .running {
-                _ = applyRunningNetworkSettings(
-                    buildNetworkSettings(remoteAddress: sourceRemote),
-                    generation: generation
-                )
+        } operation: {
+            _ = try deadline.probeTimeoutMS()
+            let mode: TunnelScenarioState.SwitchRecord.Mode
+            if canStageScenarioSwitch(from: source, to: target) {
+                try stagedScenarioSwitch(
+                    engine, to: target, dialAddress: targetRemote, underlay: underlay,
+                    generation: generation, deadline: deadline, automaticValidation: automaticValidation
+                ).get()
+                mode = .staged
+            } else {
+                try restartScenarioSwitch(
+                    engine, from: source, sourceDialAddress: sourceRemote,
+                    to: target, targetDialAddress: targetRemote, underlay: underlay,
+                    generation: generation, deadline: deadline, automaticValidation: automaticValidation
+                ).get()
+                mode = .restart
             }
-            return .failure(error)
+            return ScenarioSwitchOutcome(bundle: target, remoteAddress: targetRemote, mode: mode)
+        } settle: { committed in
+            guard remoteChanges, phase(for: generation) == .running else { return }
+            // One owner restores source settings for every failure, including preparation
+            // and deadline failures. Successful commits drop the old server exclusion.
+            _ = applyRunningNetworkSettings(
+                buildNetworkSettings(remoteAddress: committed ? targetRemote : sourceRemote),
+                generation: generation
+            )
         }
     }
 
@@ -2107,7 +2157,7 @@ extension PacketTunnelProvider {
 
     /// Both switching paths use the same complete acceptance plan. Engine startup alone
     /// does not prove Tailscale authentication or an outbound's reachability.
-    private func verifyScenarioLines(_ engine: LibboxLibbox, bundle: StartBundle, prepared: Bool) throws {
+    private func verifyScenarioLines(_ engine: LibboxLibbox, bundle: StartBundle, prepared: Bool, deadline: ScenarioSwitchDeadline) throws {
         guard let data = bundle.acceptancePlanJSON.data(using: .utf8),
               let plan = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let targets = plan["targets"] as? [[String: Any]], !targets.isEmpty else {
@@ -2125,10 +2175,11 @@ extension PacketTunnelProvider {
             guard let tag = target["tag"] as? String, !tag.isEmpty else {
                 throw scenarioError("场景线路验收计划无效")
             }
+            let timeoutMS = try deadline.probeTimeoutMS()
             var error: NSError?
             let address = prepared
-                ? engine.probePreparedSwitchOutboundIP(tag, timeoutMS: 6_000, error: &error)
-                : engine.probeOutboundIP(tag, timeoutMS: 6_000, error: &error)
+                ? engine.probePreparedSwitchOutboundIP(tag, timeoutMS: timeoutMS, error: &error)
+                : engine.probeOutboundIP(tag, timeoutMS: timeoutMS, error: &error)
             guard error == nil, !address.isEmpty else {
                 throw scenarioError("新场景的线路暂时不可用：\(error?.localizedDescription ?? "出口无回应")")
             }
@@ -2141,6 +2192,7 @@ extension PacketTunnelProvider {
         dialAddress: String,
         underlay: UnderlaySnapshot,
         generation: UInt64,
+        deadline: ScenarioSwitchDeadline,
         automaticValidation: (@Sendable () -> Bool)?
     ) -> Result<Void, Error> {
         do {
@@ -2176,7 +2228,7 @@ extension PacketTunnelProvider {
             return .failure(scenarioError("新场景没能准备好：\(error.localizedDescription)"))
         }
         recordDiagnostic("scenario_switch_prepared")
-        do { try verifyScenarioLines(engine, bundle: target, prepared: true) }
+        do { try verifyScenarioLines(engine, bundle: target, prepared: true, deadline: deadline) }
         catch {
             try? engine.abortPreparedSwitch()
             return .failure(error)
@@ -2188,6 +2240,12 @@ extension PacketTunnelProvider {
         guard phase(for: generation) == .running, self.engine(for: generation) === engine else {
             try? engine.abortPreparedSwitch()
             return .failure(scenarioError("连接已结束"))
+        }
+        do {
+            _ = try deadline.probeTimeoutMS()
+        } catch {
+            try? engine.abortPreparedSwitch()
+            return .failure(error)
         }
         recordTimeline("scenario_switch_handover")
         do {
@@ -2209,6 +2267,7 @@ extension PacketTunnelProvider {
         targetDialAddress: String,
         underlay: UnderlaySnapshot,
         generation: UInt64,
+        deadline: ScenarioSwitchDeadline,
         automaticValidation: (@Sendable () -> Bool)?
     ) -> Result<Void, Error> {
         // 先让旧实例的回调失效，再停它：停止时报上来的「已断开」不是掉线。
@@ -2223,7 +2282,7 @@ extension PacketTunnelProvider {
         recordDiagnostic("scenario_switch_restarting")
 
         switch startReplacementEngine(target, dialAddress: targetDialAddress, underlay: underlay, generation: generation,
-                                      verifyLines: true, automaticValidation: automaticValidation) {
+                                      verifyLines: true, deadline: deadline, automaticValidation: automaticValidation) {
         case .success:
             return .success(())
         case .failure(let targetError):
@@ -2249,8 +2308,10 @@ extension PacketTunnelProvider {
         underlay: UnderlaySnapshot,
         generation: UInt64,
         verifyLines: Bool = false,
+        deadline: ScenarioSwitchDeadline? = nil,
         automaticValidation: (@Sendable () -> Bool)? = nil
     ) -> Result<Void, Error> {
+        do { _ = try deadline?.probeTimeoutMS() } catch { return .failure(error) }
         guard let fd = tunFileDescriptor(), fd > 0 else {
             return .failure(providerError(4, "无法获取系统隧道接口"))
         }
@@ -2290,7 +2351,10 @@ extension PacketTunnelProvider {
             return .failure(scenarioError("连接已结束"))
         }
         do {
-            if verifyLines { try verifyScenarioLines(replacement, bundle: bundle, prepared: false) }
+            if verifyLines, let deadline {
+                try verifyScenarioLines(replacement, bundle: bundle, prepared: false, deadline: deadline)
+            }
+            _ = try deadline?.probeTimeoutMS()
             guard automaticValidation?() != false else { throw scenarioError("自动判断已失效") }
         } catch {
             lifecycleLock.lock()
@@ -2379,16 +2443,17 @@ extension PacketTunnelProvider {
 
     /// App 回到前台或打开「自动」时主动刷新，不复用路径通知的结果。
     func evaluateScenario(
+        deadline: ScenarioSwitchDeadline = ScenarioSwitchDeadline(),
         completion: (@Sendable (TunnelScenarioState) -> Void)?
     ) {
         let completionBox = UncheckedSendableBox(completion)
         scenarioQueue.async { [weak self] in
             guard let self else { return }
-            self.performScenarioEvaluation(pathNotification: false) { state in completionBox.value?(state) }
+            self.performScenarioEvaluation(pathNotification: false, deadline: deadline) { state in completionBox.value?(state) }
         }
     }
 
-    private func performScenarioEvaluation(pathNotification: Bool, completion: @escaping @Sendable (TunnelScenarioState) -> Void) {
+    private func performScenarioEvaluation(pathNotification: Bool, deadline: ScenarioSwitchDeadline = ScenarioSwitchDeadline(), completion: @escaping @Sendable (TunnelScenarioState) -> Void) {
         dispatchPrecondition(condition: .onQueue(scenarioQueue))
         guard case .available(let catalog) = ScenarioSwitchCatalogStore.load(),
               catalog.policy.enabled,
@@ -2504,8 +2569,10 @@ extension PacketTunnelProvider {
                 self.settledSurvey = .init(context: context, at: surveyStart)
             }
             state.lastSurvey = survey
-            // 这次没判断出来（比如刚好断网）就保留上一次的结论。
-            guard let pick else { return }
+            guard let pick else {
+                state.suggestedScenarioID = nil
+                return
+            }
             state.lastPick = pick
             guard pick.scenarioID != runningID else {
                 state.suggestedScenarioID = nil
@@ -2530,7 +2597,7 @@ extension PacketTunnelProvider {
         let finished = DispatchSemaphore(value: 0)
         // 判断与提交必须使用同一份目录和规则。
         switchScenario(to: pick.scenarioID, origin: .automatic, expectedRevision: catalog.revision,
-                       decisionNetwork: decisionNetwork, automaticValidation: validation) { _ in
+                       deadline: deadline, decisionNetwork: decisionNetwork, automaticValidation: validation) { _ in
             finished.signal()
         }
         finished.wait()
@@ -2582,7 +2649,7 @@ extension PacketTunnelProvider {
         case "scenario-state":
             completion(scenarioStateResponse(currentScenarioState()))
         case "scenario-evaluate":
-            evaluateScenario { [weak self] state in
+            evaluateScenario(deadline: ScenarioSwitchDeadline(requested: object[ScenarioSwitchDeadline.requestKey] as? TimeInterval)) { [weak self] state in
                 completion(self?.scenarioStateResponse(state))
             }
         case "scenario-switch", "scenario-reapply":
@@ -2594,7 +2661,8 @@ extension PacketTunnelProvider {
                 to: scenarioID,
                 origin: .app,
                 expectedRevision: object["catalog_revision"] as? String,
-                reapply: cmd == "scenario-reapply"
+                reapply: cmd == "scenario-reapply",
+                deadline: ScenarioSwitchDeadline(requested: object[ScenarioSwitchDeadline.requestKey] as? TimeInterval)
             ) { [weak self] result in
                 guard let self else { return }
                 switch result {

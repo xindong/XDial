@@ -34,7 +34,7 @@ Apple TV 正式包定位为公司内部使用，保留企业预置；从 `applet
 不指定时生成无预置包，且清除上次构建留下的预置。私有内容、签名配置与凭据不得提交公开仓库。
 
 启动时由 `MobileSeed` 读取包内预置并传给 AppState，首启采用它；升级按 `revision` 添加缺失对象，
-保留用户凭据、修改和当前场景，使用 `rule_set_history` 保护已修改规则，每个 revision 成功落盘后才记账。
+保留用户凭据、修改和当前场景，使用 `rule_set_history` 与 `scenario_history` 保护已修改的规则和场景路由，每个 revision 成功落盘后才记账。
 连接前随包规则进入同一引擎缓存。Release 使用真实引擎；模拟器 Debug 的演示数据不得覆盖公司预置。
 tvOS 当前不执行手机的按出口地区自动选场景；`region_scenarios` 随同来源保留并校验，电视上由用户选择场景。
 
@@ -220,3 +220,10 @@ Next 的旧配置仍是首次只读迁移的来源，也仍在“删除数据”
 
 另外：Apple 开发者后台里 Next 的 App ID、App Group 和两份 Developer ID profile 可以作废；
 tailnet 里 `xdial-next-*` 的陈旧设备可以手动删除；本地 `build/` 下名字含 `next` 的目录可以删除。
+
+
+## 包体测量
+
+iOS、tvOS 和 Mac 商店版将同一架构的 Libbox 动态框架嵌入宿主一次，网络扩展通过宿主的 Frameworks 路径加载。每个进程仍有独立的 Go 运行时。框架 dSYM 随 xcarchive 归档。核对依赖许可时，对新包运行 `go version -m <app>/Frameworks/Libbox.framework/Libbox`（Mac 在 Contents/Frameworks），旧静态包仍从宿主及扩展可执行文件取清单。独立分发的 Mac System Extension 由系统另行安装，继续静态链接。
+
+CI 摘要比较同平台、同产物与 PR 基线的 MB 差值，并列出最大的三个文件。Apple 的压缩数是未加密 App 的 ZIP 估算值，商店设备下载和安装数以 App Store Connect 为准；Android 使用单架构 APK，Linux 使用服务 tar.gz。Windows 首个可分发 ZIP 可复用 `scripts/package-size.py`；目前没有安装包基线。

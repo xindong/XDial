@@ -134,3 +134,73 @@ final class HostUnderlayCaptureDiagnosticsTests: XCTestCase {
         XCTAssertEqual(resolution.expire(), .missingPathUpdate)
     }
 }
+
+final class UnderlayResolverSelectionTests: XCTestCase {
+    /// Tailscale MagicDNS 这类接管会把全局 DNS 换成只在自己 utun 上可达的地址。
+    /// Underlay 的 resolver 必须来自启动前默认接口所属的服务。
+    func testPrefersTheDefaultInterfaceScopedResolver() {
+        XCTAssertEqual(
+            UnderlayResolverSelection.serverAddresses(
+                interfaceName: "en1",
+                primaryInterface: "en1",
+                primaryService: "SERVICE",
+                scopedAddresses: ["202.180.64.10", "202.180.64.11"],
+                globalAddresses: ["100.100.100.100"]
+            ),
+            ["202.180.64.10", "202.180.64.11"]
+        )
+    }
+
+    /// 快照选定的默认接口不是系统主接口时不猜：退回既有的全局 DNS 语义。
+    func testFallsBackWhenTheSnapshotInterfaceIsNotPrimary() {
+        XCTAssertEqual(
+            UnderlayResolverSelection.serverAddresses(
+                interfaceName: "en1",
+                primaryInterface: "utun16",
+                primaryService: "SERVICE",
+                scopedAddresses: ["100.100.100.100"],
+                globalAddresses: ["203.0.113.53"]
+            ),
+            ["203.0.113.53"]
+        )
+    }
+
+    func testFallsBackWhenTheScopedResolverIsMissing() {
+        XCTAssertEqual(
+            UnderlayResolverSelection.serverAddresses(
+                interfaceName: "en1",
+                primaryInterface: "en1",
+                primaryService: "SERVICE",
+                scopedAddresses: nil,
+                globalAddresses: ["203.0.113.53"]
+            ),
+            ["203.0.113.53"]
+        )
+    }
+
+    /// 不带接口的采样（运行期重新取样）仍然优先作用域 resolver。
+    func testUnscopedSamplingStillPrefersThePrimaryService() {
+        XCTAssertEqual(
+            UnderlayResolverSelection.serverAddresses(
+                interfaceName: nil,
+                primaryInterface: "en1",
+                primaryService: "SERVICE",
+                scopedAddresses: ["202.180.64.10"],
+                globalAddresses: ["100.100.100.100"]
+            ),
+            ["202.180.64.10"]
+        )
+    }
+
+    func testReturnsNilWhenNoResolverIsAvailable() {
+        XCTAssertNil(
+            UnderlayResolverSelection.serverAddresses(
+                interfaceName: "en1",
+                primaryInterface: "en1",
+                primaryService: "SERVICE",
+                scopedAddresses: [],
+                globalAddresses: []
+            )
+        )
+    }
+}

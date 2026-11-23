@@ -14,5 +14,5 @@ go build -o build/android/tools/gobind github.com/sagernet/gomobile/cmd/gobind
 export PATH="$PWD/build/android/tools:$PATH"
 go run github.com/sagernet/gomobile/cmd/gomobile bind \
  -target="${ANDROID_GO_TARGET:-android/arm64,android/amd64}" -androidapi 26 \
- -trimpath -buildvcs=false \
+ -trimpath -buildvcs=false -ldflags="-s -w" \
  -tags with_gvisor,with_utls -o build/android/Libbox.aar ./core/libbox

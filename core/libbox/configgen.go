@@ -1564,7 +1564,7 @@ func materializeNERuleSetsWithFetchForRule(profile *config.Profile, basePath str
 					taskID,
 					"rule-set-unavailable",
 				)
-				return nil, fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
+				return nil, redactedFailure{fmt.Sprintf("rule set %q is unavailable and has no valid local copy", rule.ID), fetchErr}
 			}
 		}
 		if cachedErr != nil && len(content) == 0 {
@@ -1955,7 +1955,7 @@ func materializeGeneratedNERuleSetsWithEvents(
 				taskID,
 				"generated-rule-set-unavailable",
 			)
-			return nil, fmt.Errorf("generated rule set %q is unavailable and has no valid local copy", tag)
+			return nil, redactedFailure{fmt.Sprintf("generated rule set %q is unavailable and has no valid local copy", tag), fetchErr}
 		}
 		remaining -= int64(len(content))
 		set["type"] = "local"

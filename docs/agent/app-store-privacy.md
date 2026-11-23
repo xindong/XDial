@@ -45,6 +45,13 @@ App 与 Packet Tunnel 扩展声明：UserDefaults（App：CA92.1、1C8F.1；扩�
 `make check-mobile-libbox-deps` 发现 `github.com/pkg/sftp` 时失败。核对方法：对 Release 真机包的
 `XDial` 与 `XDialIOSTunnel` 运行 `xcrun nm -u`，只应出现已声明类别的符号。
 
+## 我的云主机（仅在用户使用时）
+
+用户在 iPhone 或 Mac 上使用「我的云主机」时：App 用用户填写的账号经 SSH 登录其服务器，凭据只在内存里；确认后服务器从
+`deb.sagernet.org` 安装 sing-box；部署后的测试经该服务器请求 `www.gstatic.com/generate_204`、`1.1.1.1/cdn-cgi/trace` 和
+`speed.cloudflare.com`（最多 10 MB、12 秒），这些服务看到的是服务器的 IP。数据使用说明有单独一节（版本 5），见
+[添加我的云主机](cloud-host.md)。
+
 # App Store 隐私对账（Mac）
 
 Mac 商店版（`macos/store.yml`，`XDIAL_STORE`）的数据使用说明在 `macos/Sources/XDial/DataUseNotice.swift`。

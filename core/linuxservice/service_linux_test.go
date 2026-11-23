@@ -455,6 +455,37 @@ func TestLinuxServiceKernelLifecycle(t *testing.T) {
 	os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.0.2.53\n"), 0644)
 	require(callAsUser(t, socket, "connect", 2, serviceProfile(proxy.Addr().(*net.TCPAddr).Port, false)), "ok")
 	require(callAsUser(t, socket, "disconnect", 3, nil), "ok")
+	setResolver := func(contents string) {
+		t.Helper()
+		if e := os.WriteFile("/etc/resolv.conf", []byte(contents), 0644); e != nil {
+			t.Fatal(e)
+		}
+	}
+	waitPhase := func(want string) uint64 {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var st Status
+			var connection struct{ Phase string }
+			reply := callAsUser(t, socket, "status", 0, nil)
+			if json.Unmarshal(reply.Payload, &st) == nil && json.Unmarshal(st.Connection, &connection) == nil && connection.Phase == want {
+				return st.Revision
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("never reached %s", want)
+		return 0
+	}
+	setResolver("")
+	profile := serviceProfile(proxy.Addr().(*net.TCPAddr).Port, false)
+	require(callAsUser(t, socket, "connect", waitPhase("disconnected"), profile), "waiting_network")
+	setResolver("nameserver 192.0.2.53\n")
+	waitPhase("connected")
+	app("/service-allow", "echo")
+	setResolver("")
+	require(callAsUser(t, socket, "disconnect", waitPhase("waiting_network"), nil), "ok")
+	setResolver("nameserver 192.0.2.53\n")
+	waitPhase("disconnected")
 	stop(false)
 	if _, e = os.Stat(filepath.Join(root, "capture/session.json")); !os.IsNotExist(e) {
 		t.Fatal("journal remains", e)

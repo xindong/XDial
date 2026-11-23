@@ -60,7 +60,7 @@ xdial-service switch --instance INSTANCE_FROM_STATUS --revision REVISION_FROM_ST
 xdial-service disconnect --instance INSTANCE_FROM_STATUS --revision REVISION_FROM_STATUS
 ```
 
-Profile 由普通用户进程读取并通过有界 IPC 传递；服务不接受任意文件路径、shell、系统规则或裸 sing-box 配置。服务重启产生新 instance；过期 instance/revision 不执行。`switch` 仍由共享核心一次提交 DNS/route，旧流有界排空。
+Profile 由普通用户进程读取并通过有界 IPC 传递；服务不接受任意文件路径、shell、系统规则或裸 sing-box 配置。首次拨号时缺少可用网络会返回 `waiting_network`。服务在内存保留 Profile，网络恢复后重新检查维护锁、解析器和捕获条件再连接。手动断开会取消等待。服务重启产生新 instance；过期 instance/revision 不执行。`switch` 仍由共享核心一次提交 DNS/route，旧流有界排空。
 
 IPC 使用 Unix seqpacket。每条消息验证内核 SCM_CREDENTIALS，连接时核对 SO_PEERCRED；移交/继承的连接不能借用原用户身份。客户端在发送 Profile 前固定核对服务 UID 0。socket 父目录 root 所有且不可写，独立端点锁防止不同 state 目录抢占，帧上限 64KiB/5 秒/32 连接。服务仅允许四种操作，不按客户端自报 PID/UID 授权。
 
@@ -75,7 +75,7 @@ IPC 使用 Unix seqpacket。每条消息验证内核 SCM_CREDENTIALS，连接时
 - 实现 IPv4 TCP/UDP 透明接入；应用路径/路径前缀/精确进程名交给 sing-box 原生进程搜索器，不信客户端归因。macOS Bundle 和进程名通配符尚未适配，明确拒绝。
 - Direct DNS 与代理服务器 bootstrap 使用捕获的系统 resolver；应用代理 DNS 仍由共享编译器绑定精确 Line。标记套接字由内核按目标选择完整 Underlay，不虚构默认网卡、不重排路由。
 - 普通 resolver 文件仍仅支持一个非 loopback IPv4 nameserver；另外支持标准 `/run/systemd/resolve/stub-resolv.conf` 链接和真实 systemd-resolved 服务，保留系统的 per-link/split DNS。仅支持 DNS socket 入口；`nss-resolve`、未知 NSS hosts 模块和 nscd 共享缓存返回 `unsupported_native_resolver_ingress`，不能把共享进程查询冒充原应用身份。原生 NSS 适配仍待完成，服务不会替用户改写这些系统配置。
-- resolved 模式只豁免经系统总线、PID 1、内核进程、stub socket 与 cgroup v2 验证的 resolver 依赖套接字，不按 UID 豁免；不接受客户端指定 resolver PID、cgroup 或接口。解析器退出、身份变化、网络事实或不支持的 NSS 变化先断开，尚无自动恢复。租约验证失败返回 `unsupported_resolver_dependency`，不回退公共 DNS。
+- resolved 模式只豁免经系统总线、PID 1、内核进程、stub socket 与 cgroup v2 验证的 resolver 依赖套接字，不按 UID 豁免；不接受客户端指定 resolver PID、cgroup 或接口。网络事实变化时先撤销旧捕获，再使用新快照恢复；解析器租约失效或出现不支持的 NSS 时结束连接。租约验证失败返回 `unsupported_resolver_dependency`，不回退公共 DNS。
 - 仅允许经过共享编译和验证的离线规则缓存；尚无服务缓存导入/在线资源事务。客户端本地 file URL 和 NativeOptions 文件访问能力被拒绝，不能让 root 读取用户指定私有文件。
 - AnyConnect/Tailscale 协议套接字与冷资源租约、IPv6、现有 mark/iptables 共存、GUI、完整配置库接线、多发行版安装/更新仍待完成。保留这些目标，不能将当前拒绝当作最终产品取舍。
 - systemd unit 需要 `CAP_NET_BIND_SERVICE`，用于透明 UDP 回包绑定原目标的特权端口（如 DNS 53）；完整 Debian 负面/正面对照已验证。安装脚本不改变系统低端口阈值。

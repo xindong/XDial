@@ -60,7 +60,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(XDIAL_BUNDLE_ID).tunnel
         SWIFT_VERSION: "6.0"
     dependencies:
-      - framework: ../build/Libbox.xcframework
+      - framework: ../build/shared/tvos/Libbox.xcframework
         embed: false
       - sdk: libresolv.tbd
 
@@ -135,6 +135,6 @@ targets:
     dependencies:
       - target: XDialTVTunnel
         embed: true
-      - framework: ../build/Libbox.xcframework
-        embed: false
+      - framework: ../build/shared/tvos/Libbox.xcframework
+        embed: true
       - sdk: libresolv.tbd

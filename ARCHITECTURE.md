@@ -182,10 +182,12 @@ Direct 使用完整 Underlay 的解析语义，不寻找绕过既有 VPN 的“�
 
 | 输入 | 解析路径 |
 |---|---|
-| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；响应校验事务 ID、问题和目标 |
+| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；App socket 绑定了接口时（如 mDNSResponder 查询 utun 上的 MagicDNS）沿用该接口；响应校验事务 ID、问题和目标 |
 | 无原始 flow 的盒内主动解析 | 使用 Apple `DNSServiceGetAddrInfo`，保留系统 scoped resolver、搜索域与既有叠加 |
 
 已被接管、等待 Provider 应答的查询不能再次交给 mDNSResponder。
+SOCKS5 UDP ASSOCIATE 不携带关联级元数据，绑定接口由 Provider 在关联的首个标记数据报中
+送达（patches/sing-box/0020），sing-box 读取后丢弃该数据报。
 缺少原始上下文或校验失败不回落到重建查询、首选 resolver 裸 UDP 或公共 DNS。
 Provider 不读域名、不执行第二次 DNS 裁决。
 
@@ -384,12 +386,14 @@ NWPath 更新与 configd 对相应键的只读通知都触发重新采样；日�
 新样本不证明旧 generation 仍是当前事实，真实指纹变化才换代。Provider 仍 connected 时，
 Line 自己处理协议恢复，不能仅凭路径不可用 / 恢复边沿重复连接。
 
+各端从首次拨号起保留用户的连接意图。共享包 `core/recovery` 维护临时网络错误的类型判断与主动重试间隔；Android 和 Linux 服务复用其中的连接状态机。macOS 把同一失败分类与预算接到事务回滚；iOS 与 tvOS 通过同一启动包和 NetworkExtension 按需规则恢复，后台唤醒时机由系统决定。认证、证书和配置错误终止本次意图，手动断开取消等待和后续重试。
+
 同代 Line 局部恢复保持其他 Line、Ingress、Box 与 transaction ID 不变；局部预算耗尽、
 Provider 掉线或共享组件失败才提升为完整恢复。休眠或无可用 Underlay 期间局部恢复只等待，
 不消耗预算、不提升（见 [AnyConnect](#33-anyconnectd30)）。完整恢复在 Rollback 与系统接管移除后进行，
 预算属于恢复 epoch `(desired Scenario, Underlay 指纹, 连通性代数)`：每个 epoch 按
 2 / 5 / 10 / 20 / 30 秒最多五次，等待可用 Underlay 不计次；短暂连上不重置，同一事务
-稳定五分钟后才清零。只看结构化失败码：凭据、登录、认证、配置引用与未分类错误立即结束。
+稳定五分钟后才清零。手动点拨盘后首次建连遇到临时网络错误（如 AnyConnect 拨号超时）也沿用这套恢复流程，用户取消即结束。只看结构化失败码：凭据、登录、认证、配置引用与未分类错误立即结束。
 
 网络相关失败耗尽预算后进入停泊：运行状态是已报告的断开，系统接管已移除，连接意图保留，
 宿主从耗尽后重新捕获的 Underlay 起只读观察，不建数据面、不发网络请求。经沉降的新

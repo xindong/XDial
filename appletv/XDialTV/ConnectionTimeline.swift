@@ -365,8 +365,7 @@ final class ConnectionTimelineStore: @unchecked Sendable {
         Self.queue.sync { read(.app).sessions.first { $0.id == id }?.stopRequestedAt != nil }
     }
 
-    /// Test helper: waits until queued appends have been attempted.
-    /// Production shutdown uses the asynchronous endActiveSession completion.
+    /// Wait for queued writes before returning a startup failure to the system.
     func flush() {
         Self.queue.sync {}
     }

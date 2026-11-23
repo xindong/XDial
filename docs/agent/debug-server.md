@@ -71,6 +71,19 @@ curl -sS -X POST 127.0.0.1:19877/action \
   beta 开关，已装标签恒为空，所以开关、“等待正式版”和已装 beta 的标签显示只能用正式身份的
   验收包验证，`fake-update` 只覆盖候选侧的标签与 Beta 标记。
 
+## macOS 场景切换诊断
+
+在出现提示的 Mac 上运行以下只读命令。商店版、独立 Debug 与正式版都可从系统统一日志查询：
+
+```sh
+/usr/bin/log show --last 12h --info --style compact \
+  --predicate 'subsystem CONTAINS[c] "xdial" AND eventMessage CONTAINS "scenario-switch"'
+```
+
+按候选事务 ID 对齐宿主的 `scenario-switch-cancel-request` 与扩展的终态记录。
+`reason` 记录发起取消时的事件，`automatic` 表示该候选来自自动网络判断，`sent` 表示宿主已开始向扩展发送切换请求。
+取消请求可能赶在提交之后到达，最终是否切换以提交或失败记录为准。较早版本只有扩展侧记录。
+
 ## Release 的安装记录
 
 Release 与 Debug 都将安装报告写入当前用户日志目录的 `installation-report.json`：

@@ -10,6 +10,8 @@ import Foundation
 ///   "schema_version": 1,
 ///   "revision": 1,
 ///   "region_scenarios": { "US": "场景 ID", "*": "其它地区用的场景 ID" },
+///   "rule_set_history": { "手动规则 ID": [{ "domains": […], "cidrs": […] }] },
+///   "scenario_history": { "场景 ID": [{ "default_line_id": "…", "bindings": [{ "rule_set_id": "…", "line_id": "…" }] }] },
 ///   "profile": { …与「导出配置」里的 profile 相同，不得包含账号密码… }
 /// }
 /// ```
@@ -82,8 +84,29 @@ struct MobileSeed: Equatable, Sendable {
                 }
             }
         }
+        // 预置改过路由的场景，记着之前各版发过的默认出口和规则绑定，同样只用来判断用户有没有改过。
+        var scenarioHistory: [String: [ShippedScenarioRouting]] = [:]
+        if let raw = root["scenario_history"] {
+            guard let entries = raw as? [String: [Any]] else { throw MobileConfigurationError.unsupportedFormat }
+            let lineIDs = Set(profile.lines.map(\.id))
+            let ruleIDs = Set(profile.ruleSets.map(\.id))
+            for (scenarioID, versions) in entries {
+                guard profile.scenarios.contains(where: { $0.id == scenarioID }) else {
+                    throw MobileConfigurationError.unsupportedFormat
+                }
+                scenarioHistory[scenarioID] = try versions.map { version in
+                    guard let routing = ShippedScenarioRouting.decode(version),
+                          lineIDs.contains(routing.defaultLineID),
+                          routing.bindings.allSatisfy({ ruleIDs.contains($0.ruleSetID) && lineIDs.contains($0.lineID) }) else {
+                        throw MobileConfigurationError.unsupportedFormat
+                    }
+                    return routing
+                }
+            }
+        }
         return MobileSeed(
-            profileSeed: ProfileSeed(profile: profile, revision: revision.intValue, ruleSetHistory: history),
+            profileSeed: ProfileSeed(profile: profile, revision: revision.intValue, ruleSetHistory: history,
+                                     scenarioHistory: scenarioHistory),
             regionScenarios: regions
         )
     }

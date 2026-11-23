@@ -156,6 +156,7 @@ enum DataUseNotice {
                 t("连接记录和诊断信息（含出口 IP 地址）保存在本机，只有你主动导出或分享时才会离开设备。",
                   "Connection history and diagnostics (including exit IP addresses) stay on the device and leave it only when you export or share them."),
             ]),
+            Section(title: CloudHostDisclosure.title(zh), symbol: "server.rack", points: CloudHostDisclosure.points(zh)),
             Section(title: t("快捷指令、控制中心和通知", "Shortcuts, Control Center and notifications"), symbol: "switch.2", points: [
                 t("它们只能连接、断开、切换场景，显示连接状态和场景名，不读取你的流量；通知默认关闭，在本机产生。",
                   "They can only connect, disconnect, switch scenarios and show the connection status and scenario name; they do not read your traffic. Notifications are off by default and created on the device."),

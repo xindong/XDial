@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/kafeifei/xdial/core/engine"
 	"sslcon/session"
@@ -451,6 +452,8 @@ type anyConnectRuntimeCapability struct {
 	networkEpoch         string
 	networkUnderlay      lineNetworkUnderlay // latest observed epoch
 	sessionInterface     string              // default route the current session was established on
+	sessionEpoch         string              // network epoch the current session was established on
+	sessionConnectTime   time.Duration       // how long establishing the current session took
 	lastRecoveryEpoch    string
 	lastRecoveryRevision uint64
 	lastRecoveryError    error
@@ -497,6 +500,8 @@ func (c *anyConnectRuntimeCapability) deactivate(
 	c.bridge = nil
 	c.session = nil
 	c.sessionInterface = ""
+	c.sessionEpoch = ""
+	c.sessionConnectTime = 0
 	c.dnsJSON = "[]"
 	c.revision++
 	return true

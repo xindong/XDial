@@ -5,6 +5,7 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kafeifei/xdial/core/recovery"
 	"sort"
 	"strings"
 	"sync"
@@ -133,7 +134,7 @@ func readinessErrorCode(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return lineReadinessCancelled
 	}
-	if transientLineReadinessError(err) {
+	if recovery.IsTransient(err) {
 		return lineReadinessTransient
 	}
 	return lineReadinessTerminal
@@ -529,9 +530,17 @@ func (l *Libbox) probeNetworkOutbound(ctx context.Context, g *lineNetworkGenerat
 		probeCtx := ctx
 		probeCancel := func() {}
 		if requirement.kind == string(config.LineTypeVPN) && g.anyConnect != nil {
-			budget := 2 * time.Second
-			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline)/3 < budget {
-				budget = time.Until(deadline) / 3
+			// A budget measured on this network may take up to two thirds of
+			// the deadline; the rest still lets a dead session be replaced.
+			budget := g.anyConnect.readinessProbeBudget(g.epoch)
+			if deadline, ok := ctx.Deadline(); ok {
+				limit := time.Until(deadline) / 3
+				if budget > anyConnectStaleProbeBudget {
+					limit *= 2
+				}
+				if limit < budget {
+					budget = limit
+				}
 			}
 			if budget > 0 {
 				probeCtx, probeCancel = context.WithTimeout(ctx, budget)

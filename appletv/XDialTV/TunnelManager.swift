@@ -140,6 +140,22 @@ struct TunnelAcceptanceTarget: Codable, Sendable, Equatable {
     let label: String
 }
 
+struct LineProbeReading: Equatable {
+    let label: String
+    let result: ConnectionTimeline.Result
+
+    static func warning(_ readings: [Self], isChinese: Bool) -> String? {
+        guard readings.contains(where: { $0.result != .ok }) else { return nil }
+        return readings.map { reading in
+            switch reading.result {
+            case .ok: return reading.label + (isChinese ? "探测通过" : " probe passed")
+            case .timeout: return reading.label + (isChinese ? "探测超时" : " probe timed out")
+            default: return reading.label + (isChinese ? "探测失败" : " probe failed")
+            }
+        }.joined(separator: isChinese ? "，" : ", ")
+    }
+}
+
 struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
     let requiresAnyConnect: Bool
     /// nil 只允许用于真正的单出口 Direct 场景。非 nil 时，它是配置页可见的
@@ -835,14 +851,16 @@ enum TunnelDiagnosticFormatter {
         defaults.synchronize()
     }
 
-    static func persistedSummary(matchingAttemptID expectedAttemptID: String? = nil) -> String? {
-        guard let text = UserDefaults(suiteName: kAppGroupIdentifier)?
-            .string(forKey: kTunnelDiagnosticKey),
+    static func persistedSnapshot(matchingAttemptID expected: String?) -> [String: Any]? {
+        guard let text = UserDefaults(suiteName: kAppGroupIdentifier)?.string(forKey: kTunnelDiagnosticKey),
               let data = text.data(using: .utf8),
-              let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return summary(snapshot, matchingAttemptID: expectedAttemptID)
+              let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              expected == nil || snapshot["attempt_id"] as? String == expected else { return nil }
+        return snapshot
+    }
+
+    static func persistedSummary(matchingAttemptID expected: String? = nil) -> String? {
+        persistedSnapshot(matchingAttemptID: expected).flatMap { summary($0) }
     }
 
     static func providerSummary(
@@ -1194,6 +1212,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
 
     /// 连接离开 connected 时，补测状态随之作废；下次连上会做完整验收。
     private func resetDegradedRecheck() {
+        engine?.lineProbeReadings = []
         recheckPolicy.clearDegraded()
         dataPathProbeIsRecheck = false
         dataPathProbeStage = nil
@@ -1415,13 +1434,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         } else {
             envelope = nil
         }
-        #if os(iOS)
-        // The provider completes start after its engine and DNS settings are ready.
-        // Foreground HTTPS checks can be suspended indefinitely on a locked phone.
         let tunnelReady = manager.connection.status == .connected
-        #else
-        let tunnelReady = dataPathVerified
-        #endif
         guard SystemOnDemandReconnectPolicy.shouldArm(
             userEnabled: systemOnDemandRequested,
             tunnelReady: tunnelReady,
@@ -1439,6 +1452,10 @@ final class TunnelManager: ObservableObject, TunnelManaging {
             appLog("TunnelManager.onDemand: secure envelope save failed status=\(keychainStatus)")
             return
         }
+        enableSystemOnDemand(manager)
+    }
+
+    private func enableSystemOnDemand(_ manager: NETunnelProviderManager) {
         let saveID = UUID()
         onDemandSaveID = saveID
         recordTimeline("on_demand.enabling")
@@ -1626,9 +1643,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         }
         switch connection.status {
         case .connected:
-            #if os(iOS)
             armSystemOnDemandIfReady()
-            #endif
             if dataPathVerified {
                 engine?.applySystemStatus("connected", connectedAt: connection.connectedDate)
             } else if previousStatus == .connected && recheckPolicy.isDegraded {
@@ -1676,6 +1691,15 @@ final class TunnelManager: ObservableObject, TunnelManaging {
             dataPathProbeID = nil
             dataPathVerified = false
             resetDegradedRecheck()
+            // The provider revokes the secure start on terminal failures, even
+            // while the app is suspended. Retire the matching system rule too.
+            if (systemOnDemandActive || onDemandSaveID != nil),
+               case .missing = OnDemandStartEnvelopeStore.load() {
+                engine?.suppressNextAutomaticReconnect()
+                suspendSystemOnDemand(clearEnvelope: true) {}
+            } else if onDemandSaveID != nil {
+                engine?.suppressNextAutomaticReconnect()
+            }
             reportEarlyStartFailureIfNeeded()
             engine?.applySystemStatus("disconnected")
             if previousStatus != connection.status, previousStatus != .invalid {
@@ -1741,6 +1765,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         let attemptID = activeStartAttemptID
         let acceptancePlan = activeAcceptancePlan
         dataPathVerified = false
+        if !isRecheck { engine?.lineProbeReadings = [] }
         if isRecheck {
             engine?.dataPathRechecking = true
             appLog("DataPathProbe: recheck begin")
@@ -2133,6 +2158,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     }
 
     private func probeLines(_ targets: [TunnelAcceptanceTarget]) async -> [String: OutboundAddressProbeResult] {
+        let probeID = dataPathProbeID
         recordProbeCheckpoint("开始线路试拨")
         var results: [String: OutboundAddressProbeResult] = [:]
         await withTaskGroup(of: (TunnelAcceptanceTarget, OutboundAddressProbeResult).self) { group in
@@ -2148,8 +2174,13 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                 }
             }
             for await (target, probe) in group {
-                guard !Task.isCancelled else { continue }
+                guard !Task.isCancelled, probeID != nil, probeID == dataPathProbeID else { continue }
                 results[target.tag] = probe
+                engine?.lineProbeReadings = targets.compactMap { target in
+                    guard let reading = results[target.tag] else { return nil }
+                    return LineProbeReading(label: target.label, result: reading.address != nil
+                        ? .ok : ConnectionTimeline.classify(probeFailure: reading.failure))
+                }
                 recordTimeline(
                     "check.line",
                     result: probe.address != nil ? .ok
@@ -2511,7 +2542,11 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         activeStartAttemptID = nil
         startWatchdogTask?.cancel()
         startWatchdogTask = nil
-        let diagnostics = TunnelDiagnosticFormatter.persistedSummary(matchingAttemptID: attemptID)
+        let snapshot = TunnelDiagnosticFormatter.persistedSnapshot(matchingAttemptID: attemptID)
+        if !OnDemandStartEnvelopeFailurePolicy.isTransient(stage: snapshot?["stage"] as? String) {
+            engine?.suppressNextAutomaticReconnect()
+        }
+        let diagnostics = snapshot.flatMap { TunnelDiagnosticFormatter.summary($0) }
         let message = "连接启动失败"
         engine?.lastError = diagnostics.map { "\(message)\n诊断：\($0)" } ?? message
         appLog("TunnelManager.start: asynchronous failure diagnostics=\(diagnostics ?? "unavailable")")
@@ -2672,10 +2707,30 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         scenarioName: String,
         cachedOnly: Bool = false
     ) -> Result<StartSession, NSError> {
+        guard profileJSON.utf8.count <= kMaxNEConfigBytes else {
+            return .failure(NSError(domain: "XDial", code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "连接配置过大，无法安全启动"]))
+        }
         var genError: NSError?
         #if os(iOS)
-        let raw = cachedOnly ? LibboxGenerateCachedNESession(profileJSON, server, basePath, &genError)
-            : LibboxGenerateNESession(profileJSON, server, basePath, &genError)
+        let raw: String
+        if cachedOnly {
+            raw = LibboxGenerateCachedNESession(profileJSON, server, basePath, &genError)
+        } else {
+            let result = LibboxGenerateNESessionResult(profileJSON, server, basePath)!
+            if !result.message.isEmpty {
+                if result.retryable {
+                    return .success(StartSession(configJSON: "{}", parameters: [
+                        "preparation_profile": profileJSON,
+                        ScenarioStartParameter.scenarioID: scenarioID,
+                        ScenarioStartParameter.scenarioName: scenarioName,
+                    ]))
+                }
+                return .failure(NSError(domain: "XDial", code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: result.message]))
+            }
+            raw = result.value
+        }
         if let genError { return .failure(genError) }
         guard let data = raw.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -2696,8 +2751,15 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         // Tailscale 仍放在各代 Box 里：iOS 配置会带上所有启用的 Tailscale 线路，而由进程持有的
         // Tailscale 只支持一条。两边都用到 Tailscale 的切换由扩展换引擎完成。
         #else
-        let configJSON = LibboxGenerateNEConfig(profileJSON, server, basePath, &genError)
-        if let genError { return .failure(genError) }
+        let result = LibboxGenerateNEConfigResult(profileJSON, server, basePath)!
+        if !result.message.isEmpty {
+            if result.retryable {
+                return .success(StartSession(configJSON: "{}", parameters: ["preparation_profile": profileJSON]))
+            }
+            return .failure(NSError(domain: "XDial", code: -5,
+                userInfo: [NSLocalizedDescriptionKey: result.message]))
+        }
+        let configJSON = result.value
         let parameters: [String: String] = [:]
         #endif
         guard configJSON.utf8.count <= kMaxNEConfigBytes else {
@@ -2794,6 +2856,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                     self.engine?.applySystemStatus("disconnected")
                     self.finishStartOperation(operationID, result: .failure(error))
                 case .success:
+                    var savedForNetworkRecovery = false
                     do {
                         guard self.isCurrentStartOperation(operationID) else { return }
                         guard let session = self.manager?.connection as? NETunnelProviderSession else {
@@ -2849,15 +2912,43 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                             } ?? message
                             self.engine?.suppressNextAutomaticReconnect()
                             self.engine?.applySystemStatus("disconnecting")
+                            // Bound this start without cancelling the user's recovery
+                            // request. A terminal provider error revokes the envelope.
+                            if (self.systemOnDemandActive || self.onDemandSaveID != nil),
+                               case .available = OnDemandStartEnvelopeStore.load() {
+                                session?.stopVPNTunnel()
+                                self.startWatchdogTask = nil
+                                return
+                            }
                             self.stopAfterSuspendingOnDemand {
                                 session?.stopVPNTunnel()
                             }
                             self.startWatchdogTask = nil
                         }
+                        // Persist before submitting the manual start so an immediate
+                        // failure can revoke it. Arm only after submission so iOS
+                        // cannot race the user's first start with a cold start.
+                        if allowSystemOnDemand, self.systemOnDemandRequested, !self.systemOnDemandSuspendedForSetup,
+                           let envelope = self.pendingOnDemandEnvelope {
+                            savedForNetworkRecovery = OnDemandStartEnvelopeStore.save(envelope) == errSecSuccess
+                            startOptions["onDemandEnvelopeSaved"] = NSNumber(value: savedForNetworkRecovery)
+                        }
                         try session.startTunnel(options: startOptions)
+                        if savedForNetworkRecovery, let manager = self.manager {
+                            self.enableSystemOnDemand(manager)
+                        }
                         self.finishStartOperation(operationID, result: .success(()))
                     } catch {
                         guard self.isCurrentStartOperation(operationID) else { return }
+                        let cause = error as NSError
+                        if savedForNetworkRecovery, let manager = self.manager,
+                           cause.domain == NEVPNConnectionErrorDomain,
+                           cause.code == NEVPNConnectionError.noNetworkAvailable.rawValue {
+                            self.engine?.suppressNextAutomaticReconnect()
+                            self.enableSystemOnDemand(manager)
+                        } else {
+                            _ = OnDemandStartEnvelopeStore.clear()
+                        }
                         self.activeStartAttemptID = nil
                         self.startWatchdogTask?.cancel()
                         self.startWatchdogTask = nil
@@ -2976,13 +3067,14 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                   "cmd": reapply ? "scenario-reapply" : "scenario-switch",
                   "scenario_id": scenarioID,
                   "catalog_revision": revision,
+                  ScenarioSwitchDeadline.requestKey: ScenarioSwitchDeadline().uptime,
               ]) else {
             return .failed("VPN 扩展不可用", nil)
         }
         return await withCheckedContinuation { continuation in
             let oneShot = OneShotContinuation<ScenarioSwitchReply>(continuation)
-            // 准备新场景可能要连 AnyConnect 并逐条确认出口；扩展侧每一步都有自己的时限。
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 90) {
+            // 请求携带整次切换的截止时间；watchdog 额外留出中止、恢复与回包时间。
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + ScenarioSwitchDeadline.replySeconds) {
                 oneShot.finish(.failed("VPN 扩展没有及时回应", nil))
             }
             do {
@@ -3011,11 +3103,14 @@ final class TunnelManager: ObservableObject, TunnelManaging {
 
     func requestScenarioEvaluation() async -> ScenarioEvaluationReply {
         guard let session = providerSession else { return .unavailable }
-        let request = Data("{\"cmd\":\"scenario-evaluate\"}".utf8)
+        guard let request = try? JSONSerialization.data(withJSONObject: [
+            "cmd": "scenario-evaluate",
+            ScenarioSwitchDeadline.requestKey: ScenarioSwitchDeadline().uptime,
+        ]) else { return .unavailable }
         return await withCheckedContinuation { continuation in
             let oneShot = OneShotContinuation<ScenarioEvaluationReply>(continuation)
             // 读 Wi-Fi 名称最多 3 秒、查出口最多 8 秒，判断出要切换时还要等切换结束。
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 90) {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + ScenarioSwitchDeadline.replySeconds) {
                 oneShot.finish(.unavailable)
             }
             do {
@@ -3083,6 +3178,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         }
         activeAcceptancePlan = plan
         guard let connection = manager?.connection, connection.status == .connected else { return }
+        engine?.lineProbeReadings = []
         // 切换不断开连接：自检没通过时保留连接并提示，不按首次连接的规则断开。
         verifyDataPath(for: connection, isRecheck: true)
     }

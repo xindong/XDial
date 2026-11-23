@@ -96,6 +96,7 @@ var platforms = map[string]platform{
 			"regions":          "this app version cannot select a Scenario by exit region; the user picks it",
 			"offline_rules":    "this app version bundles no rule files; China rule sets download on first use",
 			"rule_set_history": "this app version replaces the preset's rules on every update, so it needs no history",
+			"scenario_history": "this app version replaces the preset's Scenario routing on every update, so it needs no history",
 		},
 	},
 }

@@ -4,7 +4,7 @@ import Foundation
 /// build requires it; bump `version` when the notice changes materially so users
 /// confirm again.
 enum DataUseNoticeAcceptance {
-    static let version = 4
+    static let version = 5
     static let defaultsKey = "xdial.data-use-notice-version"
 
     static var requiredByBuild: Bool {
@@ -89,6 +89,7 @@ enum MacDataUseNotice {
                 t("通知和登录时启动默认关闭，只在你打开后生效；通知在本机产生。",
                   "Notifications and launch at login are off until you turn them on; notifications are created on the Mac."),
             ]),
+            Section(title: CloudHostDisclosure.title(zh), symbol: "server.rack", points: CloudHostDisclosure.points(zh)),
         ]
     }
 }

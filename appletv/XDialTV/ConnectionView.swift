@@ -70,7 +70,7 @@ struct ConnectionView: View {
     private var primaryButton: some View {
         Button(action: primaryAction) {
             HStack(spacing: 16) {
-                Image(systemName: app.isConnected ? "stop.fill" : "play.fill")
+                Image(systemName: (app.isConnected || app.waitingForNetwork) ? "stop.fill" : "play.fill")
                 Text(primaryLabel)
                     .fontWeight(.semibold)
             }
@@ -82,19 +82,21 @@ struct ConnectionView: View {
     }
 
     private var primaryLabel: String {
+        if app.waitingForNetwork { return app.tr("取消连接", "Cancel Connection") }
         if app.isConnected { return app.tr("断开", "Disconnect") }
         if app.isBusy { return app.tr("请稍候…", "Please wait…") }
         return app.tr("连接", "Connect")
     }
 
     private var primaryDisabled: Bool {
+        if app.waitingForNetwork { return false }
         if app.isBusy { return true }
         // 已连接时始终允许断开；未连接时按 canConnect 判定
         return app.isConnected ? false : !app.canConnect
     }
 
     private func primaryAction() {
-        if app.isConnected {
+        if app.isConnected || app.waitingForNetwork {
             app.disconnect()
         } else {
             app.connect()

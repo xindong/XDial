@@ -38,7 +38,7 @@ class VersionContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(build, "BUILD", Path(tmp)):
             source = Path(tmp) / "input.apk"
             source.write_bytes(b"non-APK packaging fixture")
-            details = dict(version_code=1, signing="unsigned")
+            details = dict(version_code=1, signing="unsigned", abis=["arm64-v8a"])
             first = build.package_artifact(source, details, dict(source_revision="a" * 40))
             second = build.package_artifact(source, details, dict(source_revision="b" * 40))
             self.assertNotEqual(first, second)
@@ -53,9 +53,10 @@ class RealSigningContract(unittest.TestCase):
     def test_real_signer_pinned_certificate_and_tamper_rejection(self):
         env, tools, _, _ = build.tool_environment()
         source = Path(os.environ["XDIAL_ANDROID_TEST_APK"]).resolve()
+        abi = os.environ["XDIAL_ANDROID_TEST_ABI"]
         code = build.version_code(build.read_contract(), os.environ.get("XDIAL_ANDROID_TEST_CODE"), os.environ)
         name = build.read_contract()["versionName"]
-        build.inspect_apk(source, "unsigned", code, name, tools, env)
+        build.inspect_apk(source, "unsigned", code, name, tools, env, expected_abis=[abi])
         # Disposable certificate solely for signing-contract acceptance. It is
         # not the XDial test channel identity and no signed fixture is published.
         with tempfile.TemporaryDirectory(prefix="xdial-signing-fixture-") as tmp:
@@ -73,9 +74,9 @@ class RealSigningContract(unittest.TestCase):
             env["XDIAL_ANDROID_CERT_SHA256"] = build.hashlib.sha256(certificate).hexdigest()
             target = Path(tmp) / "signed.apk"
             expected = build.sign_apk(source, target, tools, env)
-            build.inspect_apk(target, "signed", code, name, tools, env, expected)
+            build.inspect_apk(target, "signed", code, name, tools, env, expected, [abi])
             with self.assertRaisesRegex(ValueError, "pinned certificate"):
-                build.inspect_apk(target, "signed", code, name, tools, env, "0" * 64)
+                build.inspect_apk(target, "signed", code, name, tools, env, "0" * 64, [abi])
             with target.open("r+b") as stream:
                 stream.seek(64)
                 original = stream.read(1)

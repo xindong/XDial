@@ -395,6 +395,7 @@ enum MobileDiagnosticsService {
         dataPathSummary: String?,
         autoScenarioSummary: String? = nil,
         onDemandStatus: String? = nil,
+        connectOnOpen: Bool? = nil,
         environment: String? = nil,
         scenarioName: String? = nil,
         timeline: ConnectionTimeline.File? = nil,
@@ -405,6 +406,11 @@ enum MobileDiagnosticsService {
             profile: profile, lastError: lastError, dataPathSummary: dataPathSummary,
             autoScenarioSummary: autoScenarioSummary, isChinese: isChinese)
         var sections = [base]
+        if let connectOnOpen {
+            sections.append(isChinese
+                ? "打开 XDial 后自动连接：" + (connectOnOpen ? "已开启" : "已关闭")
+                : "Connect when XDial opens: " + (connectOnOpen ? "On" : "Off"))
+        }
         if let onDemandStatus {
             let safe = redacted(onDemandStatus, using: profile) ?? ""
             sections.append((isChinese ? "系统按需重连：" : "System on-demand reconnect: ") + safe)

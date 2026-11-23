@@ -17,6 +17,7 @@ extension AppState {
         var settings = ["language": language.rawValue]
         #if os(macOS)
         settings["connectOnOpen"] = String(autoConnect)
+        settings[ConnectionNotice.networkPreferenceKey] = String(ConnectionNotice.preferences.bool(forKey: ConnectionNotice.networkPreferenceKey))
         settings["macLaunchAtLogin"] = String(launchAtLogin)
         settings["appearance"] = appearance.rawValue
         settings["macSOCKSPort"] = String(localSOCKSShare.port)
@@ -44,6 +45,9 @@ extension AppState {
     func applyCloudPreferences(_ settings: [String: String]) {
         if let code = settings["language"], let lang = Lang(rawValue: code) { language = lang }
         #if os(macOS)
+        if let value = settings[ConnectionNotice.networkPreferenceKey].flatMap(Bool.init) {
+            ConnectionNotice.preferences.set(value, forKey: ConnectionNotice.networkPreferenceKey)
+        }
         if let value = settings["macLaunchAtLogin"].flatMap(Bool.init), value != launchAtLogin { launchAtLogin = value }
         if let value = settings["appearance"].flatMap(AppAppearance.init(rawValue:)) { appearance = value }
         if let value = settings["macSOCKSPort"].flatMap(Int.init) { localSOCKSShare.setPort(value) }

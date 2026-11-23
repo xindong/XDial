@@ -175,11 +175,76 @@ enum SettingsLayoutPreview {
                 try png.write(to: URL(fileURLWithPath: outputDirectory).appendingPathComponent(name + ".png"))
             }
             print("Rendered five settings pages in one native window: \(outputDirectory)")
+            try await captureCloudHost()
             exit(0)
         } catch {
             fputs("Layout preview failed: \(error)\n", stderr)
             exit(1)
         }
+    }
+}
+
+extension SettingsLayoutPreview {
+    /// Renders the "add my server" sheet in each stage with synthetic data.
+    static func captureCloudHost() async throws {
+        let key = CloudHostKey(fingerprint: "SHA256:VeZpVFtrjNbE0TOrxV6LXNvckf9dPyH81cI9y0/RewU", algorithm: "ssh-ed25519", file: "/etc/ssh/ssh_host_ed25519_key.pub")
+        let report = CloudHostSetupModel.previewDecode(CloudHostReport.self, """
+        {"host_key":{"fingerprint":"\(key.fingerprint)","algorithm":"ssh-ed25519"},"system":"Ubuntu 24.04.1 LTS","architecture":"x86_64",
+         "privilege":"sudo-password","ufw_active":true,"suggested_port":43111,"blocking":[],
+         "notes":[{"code":"ufw_active","message":"服务器开着 ufw 防火墙。XDial 只为代理端口添加一条放行规则，回滚时删除。","message_en":""},
+                  {"code":"security_group","message":"如果服务商有安全组或防火墙面板，需要在那里放行代理端口（TCP 和 UDP）；XDial 无法替你修改。","message_en":""}]}
+        """)
+        let plan = CloudHostSetupModel.previewDecode(CloudHostPlan.self, """
+        {"port":43111,"method":"2022-blake3-aes-128-gcm","reuse":false,"steps":[
+         {"id":"apt_key","title":"添加 sing-box 官方软件源的签名密钥","title_en":"","detail":"/etc/apt/keyrings/xdial-sagernet.asc"},
+         {"id":"apt_source","title":"添加 sing-box 官方软件源","title_en":"","detail":"/etc/apt/sources.list.d/xdial-sagernet.sources (https://deb.sagernet.org/)"},
+         {"id":"install","title":"用 apt 安装 sing-box（校验软件包签名）","title_en":"","detail":"apt-get install sing-box"},
+         {"id":"config","title":"写入代理配置：Shadowsocks 2022，端口 43111，新生成的密钥","title_en":"","detail":"/etc/xdial-proxy/config.json"},
+         {"id":"unit","title":"添加独立的系统服务 xdial-proxy","title_en":"","detail":"/etc/systemd/system/xdial-proxy.service"},
+         {"id":"ufw","title":"在 ufw 里只放行端口 43111（TCP 和 UDP）","title_en":"","detail":"ufw allow 43111/tcp, 43111/udp"},
+         {"id":"start","title":"启动服务并确认它在端口 43111 上监听","title_en":""}]}
+        """)
+        let deployed = CloudHostResult(server: "203.0.113.10", port: 43111, method: "2022-blake3-aes-128-gcm", password: "", reused: false)
+        let measurement = CloudHostSetupModel.previewDecode(CloudHostMeasurement.self,
+            #"{"latency_ms":206,"exit_ip":"203.0.113.10","download_bytes":10000000,"download_ms":241,"mbps":331.3}"#)
+        let events = ["prepare", "apt_key", "apt_source", "install"].map { CloudHostEvent(step: $0, status: $0 == "install" ? "running" : "done", message: nil) }
+        let stages: [(String, CloudHostSetupModel.Stage, [CloudHostEvent])] = [
+            ("cloud-host-1-server", .server, []),
+            ("cloud-host-2-fingerprint", .confirmKey(key), []),
+            ("cloud-host-3-review", .review(report), []),
+            ("cloud-host-4-deploying", .deploying, events),
+            ("cloud-host-5-verified", .verified(deployed, measurement), []),
+            ("cloud-host-6-unverified", .unverified(deployed, CloudHostMessage(code: "proxy_unreachable",
+                message: "经这条线路的 HTTPS 请求没有成功。请确认服务商的安全组或防火墙已放行代理端口（TCP 和 UDP），然后重新测试。", messageEN: "")), []),
+        ]
+        for (name, stage, events) in stages {
+            let model = CloudHostSetupModel()
+            model.host = "203.0.113.10"
+            model.user = "ubuntu"
+            model.password = "preview"
+            model.proxyPort = "43111"
+            model.lineName = "云主机 · 203.0.113.10"
+            model.preview(stage: stage, plan: plan, events: events)
+            let root = NavigationStack {
+                CloudHostSetupView(model: model, chinese: true, onSave: { _ in true }, onClose: {})
+            }
+            // Taller than the real sheet so a page renders without scrolling.
+            .frame(width: 560, height: 1180)
+            .preferredColorScheme(.light)
+            let hosting = NSHostingView(rootView: root)
+            let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 560, height: 1180),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = hosting
+            window.orderFrontRegardless()
+            try await Task.sleep(for: .milliseconds(600))
+            hosting.layoutSubtreeIfNeeded()
+            let bitmap = try hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds).unwrap()
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            let png = try bitmap.representation(using: .png, properties: [:]).unwrap()
+            try png.write(to: URL(fileURLWithPath: outputDirectory).appendingPathComponent(name + ".png"))
+            window.orderOut(nil)
+        }
+        print("Rendered the add-my-server sheet: \(outputDirectory)")
     }
 }
 

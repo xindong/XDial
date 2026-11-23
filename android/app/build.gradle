@@ -20,6 +20,14 @@ android {
   versionCode requestedCode.toInteger()
   versionName requestedName
  }
+ splits {
+  abi {
+   enable = providers.gradleProperty('xdialSplitApks').getOrElse('false').toBoolean()
+   reset()
+   include 'arm64-v8a', 'x86_64'
+   universalApk = false
+  }
+ }
  // Release stays unsigned in Gradle. The packaging tool signs a copy and
  // verifies its pinned certificate; passwords never enter Gradle's daemon.
  buildTypes { debug { applicationIdSuffix '.debug'; versionNameSuffix '-dev' } }

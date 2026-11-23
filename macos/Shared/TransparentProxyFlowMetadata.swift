@@ -310,6 +310,27 @@ enum TransparentProxyFlowMetadata {
         )
     }
 
+    /// The first datagram of a bound UDP association: a one-byte placeholder
+    /// SOCKS5 UDP request whose destination is the bound-interface envelope. The sing
+    /// SOCKS server ignores the UDP ASSOCIATE request address and reports the
+    /// first datagram's destination instead, so this is the only per-association
+    /// channel that reaches sing-box. sing-box drops the marker before routing.
+    static func boundAssociationMarkerDatagram(
+        boundInterface: String
+    ) -> Data? {
+        guard
+            let envelope = encodeBoundAssociation(boundInterface: boundInterface),
+            envelope.count <= 255
+        else {
+            return nil
+        }
+        var datagram = Data([0x00, 0x00, 0x00, 0x03, UInt8(envelope.count)])
+        datagram.append(envelope)
+        // 端口 0，加 1 字节占位载荷：sing 读取空载荷的缓存首包会直接返回 EOF。
+        datagram.append(contentsOf: [0x00, 0x00, 0x00])
+        return datagram
+    }
+
     private static func encodeBoundMetadata(
         endpoint: (family: UInt8, address: Data)?,
         hostname: String?,

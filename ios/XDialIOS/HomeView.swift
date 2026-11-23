@@ -145,7 +145,7 @@ struct HomeView: View {
         }
         .onChange(of: isIdle) { _, idle in
             // 断开以后重新看一眼，接着按当前网络选场景。
-            if idle { Task { await refreshAutoScenario() } }
+            if idle { Task { await refreshScenarioAndConnectAfterOpening() } }
         }
     }
 
@@ -222,7 +222,7 @@ struct HomeView: View {
         guard autoScenario, app.isConnected, !isAutoSwitching, !app.isSwitchingScenarioInTunnel else { return nil }
         let suggestedID: String?
         if let tunnelState = app.tunnelScenarioState {
-            suggestedID = tunnelState.suggestedScenarioID
+            suggestedID = tunnelState.currentPick == nil ? nil : tunnelState.suggestedScenarioID
         } else {
             suggestedID = autoPilot.pick?.scenarioID
         }
@@ -233,8 +233,8 @@ struct HomeView: View {
 
     /// 已连接时以 VPN 扩展的判断为准；没连接时是 App 自己的判断。
     private var currentPick: ScenarioAutoPicker.Pick? {
-        if app.isConnected, let tunnelPick = app.tunnelScenarioState?.lastPick {
-            return tunnelPick
+        if app.isConnected, let state = app.tunnelScenarioState {
+            return state.currentPick
         }
         return autoPilot.pick
     }
@@ -245,10 +245,11 @@ struct HomeView: View {
             return app.tr("正在切换上网方式…", "Switching routing…")
         }
         guard let pick = currentPick else {
-            if autoPilot.isSurveying || !autoPilot.hasSurveyed {
+            if !(app.isConnected && app.tunnelScenarioState?.lastSurvey != nil),
+               autoPilot.isSurveying || !autoPilot.hasSurveyed {
                 return app.tr("正在判断所在网络…", "Checking the current network…")
             }
-            return app.tr("没判断出来，保持当前选择", "Couldn't tell; keeping the current choice")
+            return app.tr("未能识别当前网络，沿用所选场景", "Network unidentified. Keeping the selected scenario.")
         }
         switch pick.reason {
         case .place:
@@ -296,6 +297,7 @@ struct HomeView: View {
 
     /// 点连接时，如果刚换过网络还没来得及判断，先等这一下，免得用错场景。
     private func connectAfterCheckingNetwork() {
+        app.cancelPendingLaunchConnection()
         guard autoScenario, !autoPilot.isFresh else {
             app.connect()
             return
@@ -316,7 +318,7 @@ struct HomeView: View {
 
     private var status: String { app.engine.status }
     private var isWorking: Bool {
-        ["connecting", "disconnecting", "reconnecting"].contains(status)
+        app.waitingForNetwork || ["connecting", "disconnecting", "reconnecting"].contains(status)
     }
     private var isIdle: Bool { !isWorking && !app.hasActiveTunnel }
     private var isDegraded: Bool {
@@ -352,6 +354,7 @@ struct HomeView: View {
         case "action-required": return app.tr("需要登录 Tailscale", "Tailscale Sign-in Required")
         case "connected": return app.tr("已连接", "Connected")
         default:
+            if app.waitingForNetwork { return app.tr("等待网络恢复…", "Waiting for Network…") }
             if isPreparingConnection { return app.tr("正在判断网络…", "Checking the Network…") }
             if app.activeScenarioNeedsSignIn { return app.tr("还没登录", "Not Signed In") }
             return app.tr("未连接", "Not Connected")
@@ -427,6 +430,16 @@ struct HomeView: View {
                     .contentTransition(.opacity)
                     .accessibilityIdentifier("home-status")
 
+                if app.isConnected, let warning = LineProbeReading.warning(
+                    app.engine.lineProbeReadings, isChinese: app.language == .zh
+                ) {
+                    Text(warning)
+                        .font(.footnote)
+                        .foregroundStyle(XDialTheme.warning)
+                        .multilineTextAlignment(.center)
+                        .accessibilityIdentifier("home-line-probe-warning")
+                }
+
                 // 第二行固定一行高：已连接时是计时，其它时候是一句提示。
                 Group {
                     if app.hasFormalTunnel, let connectedAt = app.engine.connectedAt {
@@ -482,7 +495,7 @@ struct HomeView: View {
 
     private func dialTapped() {
         guard !isPreparingConnection else { return }
-        if app.hasFormalTunnel || status == "connecting" || status == "reconnecting" {
+        if app.waitingForNetwork || app.hasFormalTunnel || status == "connecting" || status == "reconnecting" {
             app.disconnect()
         } else if app.tailscaleSetupLineID != nil {
             app.finishTailscaleSetup()

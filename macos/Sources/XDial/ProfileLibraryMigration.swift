@@ -122,7 +122,8 @@ enum ProfileLibraryMigration {
                     let fromLegacySeed = entry.map { !$0.digest.hasPrefix("mobile-v1-") } ?? false
                     updated = try addingMobileSeed(incoming, named: seed.name, id: profileID, to: library,
                                                    aligningLegacySeed: fromLegacySeed,
-                                                   ruleSetHistory: seed.ruleSetHistory(in: incoming))
+                                                   ruleSetHistory: seed.ruleSetHistory(in: incoming),
+                                                   scenarioHistory: seed.scenarioHistory(in: incoming))
                 } else if entry != nil {
                     updated = try refreshingSeed(incoming, profileID: profileID, named: seed.name, in: library)
                 } else {
@@ -148,9 +149,12 @@ enum ProfileLibraryMigration {
     /// `ruleSetHistory` (keyed by the imported rule IDs) lists the content earlier
     /// revisions shipped for rules the preset reworked: such a rule takes the new
     /// content only while it still equals one of them, so the user's edits stay.
+    /// `scenarioHistory` does the same for the routing (default exit and rule
+    /// bindings) of Scenarios the preset reworked; names, icons and Wi-Fi stay.
     static func addingMobileSeed(_ incoming: Profile, named name: String, id: String,
                                  to original: ProfileLibrary, aligningLegacySeed: Bool = false,
-                                 ruleSetHistory: [String: [ShippedRuleContent]] = [:]) throws -> ProfileLibrary {
+                                 ruleSetHistory: [String: [ShippedRuleContent]] = [:],
+                                 scenarioHistory: [String: [ShippedScenarioRouting]] = [:]) throws -> ProfileLibrary {
         var library = original
         let existing = library.profiles.first(where: { $0.id == id })
         // A seed inserted beside other Profiles may have had colliding IDs scoped.
@@ -200,6 +204,27 @@ enum ProfileLibraryMigration {
                                                      owned: { library.scenarioSources[$0] == id }, prefix: name + " · ")
             for note in keptCustomizations(draft.scenarios, seed: seed, prefix: name + " · ") {
                 appLog("seed: \(name) kept the user's change: \(note)")
+            }
+        }
+        // Shipped routing follows the same scoping and line reuse as the seed itself.
+        let routingHistory = Dictionary(scenarioHistory.map { key, versions in
+            (scoping[key] ?? key, versions.map { $0.mapped(lines: scoping, rules: scoping).mapped(lines: lineIDs) })
+        }, uniquingKeysWith: { a, _ in a })
+        for source in seed.scenarios {
+            guard let shipped = routingHistory[source.id], library.scenarioSources[source.id] == id,
+                  let index = draft.scenarios.firstIndex(where: { $0.id == source.id }),
+                  let target = ShippedScenarioRouting(source) else { continue }
+            let current = ShippedScenarioRouting(draft.scenarios[index])
+            guard current != target else { continue }
+            if let current, shipped.contains(current) {
+                draft.scenarios[index].defaultLineID = target.defaultLineID
+                draft.scenarios[index].defaultSubscriptionID = ""
+                draft.scenarios[index].bindings = target.bindings.map {
+                    RuleBinding(ruleSetID: $0.ruleSetID, lineID: $0.lineID)
+                }
+                draft.scenarios[index].matchOrder = []
+            } else {
+                appLog("seed: \(name) kept the user's edits to scenario \(source.id)")
             }
         }
         var claimed = Set(draft.scenarios.flatMap(\.matchSSIDs))
@@ -382,6 +407,9 @@ struct SeedProfile: Equatable {
     var sourceRuleSetIDs: [String] = []
     /// Source rule ID -> content earlier revisions shipped (rule_set_history).
     var shippedRuleContents: [String: [ShippedRuleContent]] = [:]
+    var sourceLineIDs: [String] = []
+    /// Source Scenario ID -> routing earlier revisions shipped, on source IDs (scenario_history).
+    var shippedScenarioRoutings: [String: [ShippedScenarioRouting]] = [:]
 
     /// The rule history keyed by the IDs the import gave the seed's rules, matched by position.
     func ruleSetHistory(in imported: Profile) -> [String: [ShippedRuleContent]] {
@@ -389,6 +417,20 @@ struct SeedProfile: Equatable {
         let ids = Dictionary(uniqueKeysWithValues: zip(sourceRuleSetIDs, imported.ruleSets.map(\.id)))
         return Dictionary(shippedRuleContents.compactMap { key, value in ids[key].map { ($0, value) } },
                           uniquingKeysWith: { a, _ in a })
+    }
+
+    /// The Scenario history keyed and expressed in the IDs the import gave the seed, matched by position.
+    func scenarioHistory(in imported: Profile) -> [String: [ShippedScenarioRouting]] {
+        guard !shippedScenarioRoutings.isEmpty,
+              sourceScenarioIDs.count == imported.scenarios.count,
+              sourceRuleSetIDs.count == imported.ruleSets.count,
+              sourceLineIDs.count == imported.lines.count else { return [:] }
+        let scenarios = Dictionary(uniqueKeysWithValues: zip(sourceScenarioIDs, imported.scenarios.map(\.id)))
+        let rules = Dictionary(uniqueKeysWithValues: zip(sourceRuleSetIDs, imported.ruleSets.map(\.id)))
+        let lines = Dictionary(uniqueKeysWithValues: zip(sourceLineIDs, imported.lines.map(\.id)))
+        return Dictionary(shippedScenarioRoutings.compactMap { key, versions in
+            scenarios[key].map { ($0, versions.map { $0.mapped(lines: lines, rules: rules) }) }
+        }, uniquingKeysWith: { a, _ in a })
     }
 
     func regionTargets(in imported: Profile) -> [String: String] {
@@ -457,11 +499,30 @@ struct SeedProfile: Equatable {
                     }
                 }
             }
+            let lines = (object["lines"] as? [[String: Any]]) ?? []
+            let lineIDs = lines.compactMap { $0["id"] as? String }
+            var routings: [String: [ShippedScenarioRouting]] = [:]
+            if let raw = root["scenario_history"] {
+                guard let entries = raw as? [String: [Any]] else { throw ProfileLibraryError.invalid("无效的场景历史") }
+                for (scenarioID, versions) in entries {
+                    guard ids.contains(scenarioID) else { throw ProfileLibraryError.invalid("场景历史指向不存在的场景") }
+                    routings[scenarioID] = try versions.map { version in
+                        guard let routing = ShippedScenarioRouting.decode(version),
+                              lineIDs.contains(routing.defaultLineID),
+                              routing.bindings.allSatisfy({ ruleIDs.contains($0.ruleSetID) && lineIDs.contains($0.lineID) }) else {
+                            throw ProfileLibraryError.invalid("无效的场景历史")
+                        }
+                        return routing
+                    }
+                }
+            }
             let profile = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             return SeedProfile(name: name, text: String(decoding: profile, as: UTF8.self),
                                revision: root["revision"] as? Int, sourceScenarioIDs: ids, regions: regions,
                                sourceRuleSetIDs: ruleIDs.count == rules.count ? ruleIDs : [],
-                               shippedRuleContents: shipped)
+                               shippedRuleContents: shipped,
+                               sourceLineIDs: lineIDs.count == lines.count ? lineIDs : [],
+                               shippedScenarioRoutings: routings)
         }
         return SeedProfile(name: name, text: text)
     }

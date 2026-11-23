@@ -8,10 +8,18 @@ import NetworkExtension
 enum ConnectionNotice {
     case disconnect, configurationDisabled, scenario
 
+    #if os(macOS)
+    case network(available: Bool)
+    static let networkPreferenceKey = "xdial.notify.network"
+    #endif
+
     var preferenceKey: String {
         switch self {
         case .disconnect, .configurationDisabled: "xdial.notify.disconnect"
         case .scenario: "xdial.notify.scenario"
+        #if os(macOS)
+        case .network: Self.networkPreferenceKey
+        #endif
         }
     }
 
@@ -45,6 +53,12 @@ enum ConnectionNotice {
         let chinese = language?.hasPrefix("zh") == true
         let content = UNMutableNotificationContent()
         switch self {
+        #if os(macOS)
+        case let .network(available):
+            content.title = chinese ? "系统网络已变化" : "Network changed"
+            content.body = available ? (chinese ? "网络可用" : "Network available") :
+                (chinese ? "网络不可用" : "Network unavailable")
+        #endif
         case .disconnect:
             content.title = chinese ? "XDial 意外断线" : "XDial disconnected unexpectedly"
         case .configurationDisabled:

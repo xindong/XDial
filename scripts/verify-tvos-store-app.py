@@ -40,11 +40,15 @@ def verify_target(path, bundle_id, markers):
                        ("com.apple.developer.networking.networkextension", "packet-tunnel-provider")]:
         require(value in signed.get(key, []), f"{path.name}: missing signed entitlement {key}")
     binary = (path / metadata["CFBundleExecutable"]).read_bytes()
+    verify_markers(path, binary, markers)
+    return metadata
+
+
+def verify_markers(path, binary, markers):
     for marker in markers:
         require(marker.encode() in binary, f"{path.name}: missing production engine symbol {marker}")
     for marker in ("NoopTunnelEngine", "FakeTunnelEngine", "LANShareSettings", "AddLANShareInbound", "core/macgateway."):
         require(marker.encode() not in binary, f"{path.name}: unexpected engine/experiment symbol {marker}")
-    return metadata
 
 
 def verify_seed(app, authority=None):
@@ -105,12 +109,15 @@ def main():
     extensions = list((app / "PlugIns").glob("*.appex"))
     require(len(extensions) == 1, "Expected one embedded packet tunnel")
     provider = verify_target(extensions[0], BUNDLE + ".tunnel",
-                             ["PacketTunnelProvider", "NEPacketTunnelProvider", "LibboxNew",
-                              "libbox.(*Libbox).Start"])
+                             ["PacketTunnelProvider", "NEPacketTunnelProvider", "LibboxNew"])
     require(provider.get("NSExtension", {}).get("NSExtensionPointIdentifier") ==
             "com.apple.networkextension.packet-tunnel", "Incorrect extension point")
     for key in ("CFBundleVersion", "CFBundleShortVersionString"):
         require(host[key] == provider[key], "Host and provider version mismatch")
+    subprocess.run(["python3", Path(__file__).with_name("verify-shared-libbox.py"), app], check=True)
+    framework = app / "Frameworks/Libbox.framework"
+    subprocess.run(["codesign", "--verify", "--strict", str(framework)], check=True)
+    verify_markers(framework, (framework / "Libbox").read_bytes(), ["libbox.(*Libbox).Start"])
     verify_seed(app, args.seed_authority)
     require((app / "Assets.car").is_file(), "Store artwork missing")
     require((app / "ThirdPartyNotices.txt").is_file(), "Third-party notices missing")

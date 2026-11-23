@@ -3,6 +3,15 @@ import CoreLocation
 @testable import XDial
 
 final class ScenarioAutoPilotTests: XCTestCase {
+    func testFailedTunnelSurveyKeepsRunningScenarioWithoutReportingPreviousCountry() {
+        let state = TunnelScenarioState(runningScenarioID: "home",
+            lastPick: ScenarioAutoPick(scenarioID: "home", reason: .country("HK")),
+            lastSurvey: ScenarioSurveyRecord(at: Date(), ssidRead: true, ssidMatched: false,
+                exit: .failed(viaTunnel: true, reason: "timeout"), picked: false))
+        XCTAssertEqual(state.runningScenarioID, "home")
+        XCTAssertNil(state.currentPick)
+    }
+
     func testPlaceRenewalPreservesRulesButDepartureAndDisableInvalidateThem() {
         let now = Date()
         var original = ScenarioAutoPolicy(enabled: true, wifiRules: [], regionScenarios: [:], scenarioIDs: ["home", "away"])
@@ -230,10 +239,15 @@ final class ScenarioAutoPilotTests: XCTestCase {
     @MainActor
     func testAFailedTunnelLookupIsRecordedForDiagnostics() async {
         let pilot = ScenarioAutoPilot()
+        _ = await pilot.survey(scenarios: scenarios, regionScenarios: regions) {
+            ExitCountryProbeResult(code: "HK", failure: nil)
+        }
+        XCTAssertNotNil(pilot.pick)
         let pick = await pilot.survey(scenarios: scenarios, regionScenarios: regions) {
             ExitCountryProbeResult(code: nil, failure: "连接引擎未运行")
         }
         XCTAssertNil(pick)
+        XCTAssertNil(pilot.pick)
         let record = try? XCTUnwrap(ScenarioAutoPilot.lastRecord)
         XCTAssertEqual(record?.exit, .failed(viaTunnel: true, reason: "连接引擎未运行"))
         XCTAssertEqual(record?.ssidRead, false)
@@ -269,7 +283,7 @@ final class ScenarioAutoPilotTests: XCTestCase {
         XCTAssertNil(staleResult, "a result from the previous network was applied")
         XCTAssertEqual(pilot.pick?.scenarioID, "harbor", "the stale survey overwrote the newer pick")
         XCTAssertEqual(ScenarioAutoPilot.lastRecord?.exit,
-                       .failed(viaTunnel: true, reason: ScenarioAutoPilot.staleSurveyReason))
+                       .found(code: "SG", viaTunnel: true))
     }
 
     @MainActor

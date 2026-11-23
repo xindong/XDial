@@ -106,8 +106,8 @@ struct MobileSettingsView: View {
                     Text(app.tr("连接", "Connection"))
                 } footer: {
                     Text(app.tr(
-                        "打开 XDial 时连接一次；手动断开后，切到后台再回来不会重新连接。掉线后最多自动重试 3 次。「换网络后自动连回」由系统接管，手动断开后会暂停，下次连上再恢复。",
-                        "XDial connects once when it opens; after a manual disconnect, returning to it does not reconnect. Drops are retried up to 3 times. Network-change reconnect is handled by iOS; it pauses after a manual disconnect and resumes on the next connection."
+                        "打开 XDial 时连接一次；手动断开后，切到后台再回来不会重新连接。开启「换网络后自动连回」后，首次连接遇到断网或超时，iOS 也会在网络恢复时按需重连。手动断开会取消。",
+                        "XDial connects once when it opens; after a manual disconnect, returning to it does not reconnect. With network-change reconnect enabled, iOS also retries on demand after an initial network failure. Disconnect manually to cancel."
                     ))
                 }
 
@@ -327,17 +327,21 @@ struct MobileSettingsView: View {
     }
 
     private var diagnosticReport: String {
-        MobileDiagnosticsService.report(
+        let stage = app.engine.dataPathRechecking
+            ? app.tr("正在重新检测出口与分流", "Rechecking connectivity and routing")
+            : app.engine.dataPathSummary
+        let warning = LineProbeReading.warning(app.engine.lineProbeReadings, isChinese: app.language == .zh)
+        let probeSummary = [stage, warning].compactMap { $0 }.joined(separator: " · ")
+        return MobileDiagnosticsService.report(
             version: version,
             status: diagnosticStatus,
             systemProfileInstalled: app.helperInstalled,
             profile: app.profile,
             lastError: app.engine.lastError,
-            dataPathSummary: app.engine.dataPathRechecking
-                ? app.tr("正在重新检测出口与分流", "Rechecking connectivity and routing")
-                : app.engine.dataPathSummary,
+            dataPathSummary: probeSummary.isEmpty ? nil : probeSummary,
             autoScenarioSummary: autoScenarioSummary,
             onDemandStatus: systemOnDemandStatusText,
+            connectOnOpen: app.connectOnOpenEnabled,
             environment: MobileDiagnosticsService.environmentSummary(version: version),
             scenarioName: app.activeScenario?.name,
             timeline: timelineSnapshot,

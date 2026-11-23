@@ -1558,7 +1558,7 @@ final class AppStateTests: XCTestCase {
 
         engine.setStatus("disconnected")
         XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
-        try? await Task.sleep(for: .milliseconds(1_200))
+        try? await Task.sleep(for: .milliseconds(2_300))
         XCTAssertEqual(manager.startCallCount, 2)
         XCTAssertEqual(manager.lastOrigin, .autoRetry)
         XCTAssertTrue(app.isConnected)
@@ -1568,7 +1568,7 @@ final class AppStateTests: XCTestCase {
         engine.lastError = "Previous session warning"
         app.disconnect()
         XCTAssertNil(engine.lastError)
-        try? await Task.sleep(for: .milliseconds(1_200))
+        try? await Task.sleep(for: .milliseconds(2_300))
         XCTAssertEqual(manager.stopCallCount, 1)
         XCTAssertEqual(manager.startCallCount, 2)
     }
@@ -1585,7 +1585,7 @@ final class AppStateTests: XCTestCase {
 
         engine.suppressNextAutomaticReconnect()
         engine.setStatus("disconnected")
-        try? await Task.sleep(for: .milliseconds(1_200))
+        try? await Task.sleep(for: .milliseconds(2_300))
 
         XCTAssertEqual(manager.startCallCount, 1)
         XCTAssertFalse(app.isConnected)
@@ -1603,7 +1603,7 @@ final class AppStateTests: XCTestCase {
 
         manager.simulateSystemOnDemandActive()
         engine.setStatus("disconnected")
-        try? await Task.sleep(for: .milliseconds(1_200))
+        try? await Task.sleep(for: .milliseconds(2_300))
 
         XCTAssertEqual(manager.startCallCount, 1)
     }
@@ -3577,6 +3577,28 @@ final class ConnectOnOpenTests: XCTestCase {
         }
     }
 
+    func testOpeningDuringFailedSystemStartHandsOffOnceWhenIdle() async {
+        let (app, engine, manager) = launch(makePersistence(connectOnOpen: true))
+        engine.setStatus("connecting")
+        _ = await app.connectAfterOpeningIfWanted()
+        XCTAssertEqual(manager.startCallCount, 0)
+        engine.setStatus("disconnected")
+        _ = await app.connectAfterOpeningIfWanted()
+        _ = await app.connectAfterOpeningIfWanted()
+        XCTAssertEqual(manager.startCallCount, 1)
+        XCTAssertEqual(manager.lastOrigin, .launch)
+    }
+
+    func testSuccessfulSystemStartConsumesLaunchDecision() async {
+        let (app, engine, manager) = launch(makePersistence(connectOnOpen: true))
+        engine.setStatus("connecting")
+        _ = await app.connectAfterOpeningIfWanted()
+        engine.setStatus("connected")
+        engine.setStatus("disconnected")
+        _ = await app.connectAfterOpeningIfWanted()
+        XCTAssertEqual(manager.startCallCount, 0)
+    }
+
     func testIncompleteAccountIsSkippedWithoutRetrying() async {
         let (app, _, manager) = launch(makePersistence(connectOnOpen: true))
         app.profile.lines[1].vpnPassword = ""
@@ -3699,7 +3721,7 @@ final class DataUseNoticeTests: XCTestCase {
             XCTAssertTrue(publicText.contains(service), service)
         }
         for zh in [true, false] {
-            XCTAssertEqual(DataUseNotice.sections(isChinese: zh, companyPreset: false).count, 5)
+            XCTAssertEqual(DataUseNotice.sections(isChinese: zh, companyPreset: false).count, 6)
         }
     }
 

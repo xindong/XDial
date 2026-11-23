@@ -1,0 +1,162 @@
+--- a/dns/transport/local/local.go
++++ b/dns/transport/local/local.go
+@@ -40,6 +40,9 @@
+ 	preferGo               bool
+ 	fallback               bool
+ 	xdialUseSystemResolver bool
++	xdialDialerOptions     option.DialerOptions
++	xdialBoundDialers      map[string]N.Dialer
++	xdialBoundDialerMu     sync.Mutex
+ 	resolved               ResolvedResolver
+ 	mdnsTransport          adapter.DNSTransport
+ 	dhcpTransport          dhcpTransport
+@@ -72,6 +75,7 @@
+ 		dialer:                 transportDialer,
+ 		preferGo:               options.PreferGo,
+ 		xdialUseSystemResolver: options.XDialUseSystemResolver,
++		xdialDialerOptions:     options.DialerOptions,
+ 		neighborSuffixes:       suffixes,
+ 	}, nil
+ }
+--- a/dns/transport/local/local_xdial_darwin.go
++++ b/dns/transport/local/local_xdial_darwin.go
+@@ -199,9 +199,14 @@
+ ) {
+ 	if originalQuery, loaded := dns.XDialOriginalQueryFromContext(ctx); loaded {
+ 		go func() {
++			originalDialer, err := t.xdialOriginalQueryDialer(ctx)
++			if err != nil {
++				callback(nil, err)
++				return
++			}
+ 			callback(xdialOriginalExchange(
+ 				ctx,
+-				t.dialer,
++				originalDialer,
+ 				message,
+ 				originalQuery,
+ 			))
+--- /dev/null
++++ b/dns/transport/local/local_xdial_bound.go
+@@ -0,0 +1,58 @@
++package local
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// The macOS Transparent Proxy forwards each captured DNS request to the
++// resolver endpoint the application chose. When that application socket was
++// bound to an interface, the request must leave on the same interface:
++// route.default_interface otherwise pins every unbound sing-box dialer to the
++// pre-start default interface, and a resolver that the complete Underlay only
++// reaches through another interface (for example Tailscale MagicDNS
++// 100.100.100.100 on its utun) silently black-holes. This mirrors the bound
++// interface handling the Direct outbound already applies to ordinary flows.
++func (t *Transport) xdialOriginalQueryDialer(ctx context.Context) (N.Dialer, error) {
++	metadata := adapter.ContextFrom(ctx)
++	if metadata == nil || metadata.XDialBoundInterface == "" {
++		return t.dialer, nil
++	}
++	interfaceName := metadata.XDialBoundInterface
++	t.xdialBoundDialerMu.Lock()
++	defer t.xdialBoundDialerMu.Unlock()
++	if boundDialer := t.xdialBoundDialers[interfaceName]; boundDialer != nil {
++		return boundDialer, nil
++	}
++	boundDialer, err := xdialNewBoundDialer(t.ctx, t.xdialDialerOptions, interfaceName)
++	if err != nil {
++		return nil, E.Cause(err, "create DNS dialer bound to ", interfaceName)
++	}
++	if t.xdialBoundDialers == nil {
++		t.xdialBoundDialers = make(map[string]N.Dialer)
++	}
++	t.xdialBoundDialers[interfaceName] = boundDialer
++	return boundDialer, nil
++}
++
++var xdialNewBoundDialer = func(
++	ctx context.Context,
++	base option.DialerOptions,
++	interfaceName string,
++) (N.Dialer, error) {
++	return dialer.NewWithOptions(dialer.Options{
++		Context:        ctx,
++		Options:        xdialBoundDNSDialerOptions(base, interfaceName),
++		DirectResolver: true,
++	})
++}
++
++func xdialBoundDNSDialerOptions(base option.DialerOptions, interfaceName string) option.DialerOptions {
++	base.BindInterface = interfaceName
++	return base
++}
+--- /dev/null
++++ b/dns/transport/local/local_xdial_bound_test.go
+@@ -0,0 +1,60 @@
++package local
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"net"
++)
++
++type xdialFakeDialer struct{ name string }
++
++func (d *xdialFakeDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return nil, nil
++}
++
++func (d *xdialFakeDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	return nil, nil
++}
++
++func TestXDialOriginalQueryKeepsTheFlowBoundInterface(t *testing.T) {
++	original := xdialNewBoundDialer
++	t.Cleanup(func() { xdialNewBoundDialer = original })
++	var created []string
++	xdialNewBoundDialer = func(_ context.Context, base option.DialerOptions, interfaceName string) (N.Dialer, error) {
++		if xdialBoundDNSDialerOptions(base, interfaceName).BindInterface != interfaceName {
++			t.Fatal("bound DNS dialer does not bind the flow interface")
++		}
++		created = append(created, interfaceName)
++		return &xdialFakeDialer{name: interfaceName}, nil
++	}
++	defaultDialer := &xdialFakeDialer{name: "default"}
++	transport := &Transport{ctx: context.Background(), dialer: defaultDialer}
++
++	unbound, err := transport.xdialOriginalQueryDialer(adapter.WithContext(context.Background(), &adapter.InboundContext{}))
++	if err != nil || unbound != N.Dialer(defaultDialer) {
++		t.Fatalf("unbound flow must keep the default dialer: %v %v", unbound, err)
++	}
++	ctx := adapter.WithContext(context.Background(), &adapter.InboundContext{XDialBoundInterface: "utun16"})
++	first, err := transport.xdialOriginalQueryDialer(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	second, _ := transport.xdialOriginalQueryDialer(ctx)
++	if first.(*xdialFakeDialer).name != "utun16" || first != second || len(created) != 1 {
++		t.Fatalf("bound flow dialer = %v, created = %v", first, created)
++	}
++}
++
++func TestXDialBoundDNSDialerOptionsOnlyOverridesInterface(t *testing.T) {
++	base := option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "en1", RoutingMark: 7}}
++	bound := xdialBoundDNSDialerOptions(base, "utun16")
++	if bound.BindInterface != "utun16" || bound.RoutingMark != 7 || base.BindInterface != "en1" {
++		t.Fatalf("unexpected bound options: %+v (base %+v)", bound, base)
++	}
++}
