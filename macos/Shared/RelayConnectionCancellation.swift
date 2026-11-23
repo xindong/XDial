@@ -25,4 +25,10 @@ enum RelayConnectionCancellation {
             connection.forceCancel()
         }
     }
+
+    /// The same contract for the loopback legs to sing-box: an immediate
+    /// cancellation resets the stream instead of waiting on a graceful FIN.
+    static func cancel(_ socket: RelaySocket, error: Error?) {
+        socket.close(abortive: mode(for: error) == .immediate)
+    }
 }

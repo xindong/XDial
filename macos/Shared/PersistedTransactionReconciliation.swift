@@ -43,7 +43,8 @@ enum PersistedTransactionReconciliation {
         report: ConnectionReport,
         ownership: TransactionOwnership,
         systemSession: SystemProxySessionState,
-        hostIntentActive: Bool
+        hostIntentActive: Bool,
+        explicitlyStoppedTransactionID: String?
     ) -> PersistedTransactionDisposition {
         switch report.state {
         case .failed, .cancelled:
@@ -53,7 +54,11 @@ enum PersistedTransactionReconciliation {
         case .committed:
             switch systemSession {
             case .absent, .inactive:
-                return .markProviderSessionLost
+                // The local journal can still show committed after a stop.
+                // Only a stop of this exact transaction explains its loss.
+                return report.transactionID == explicitlyStoppedTransactionID
+                    ? .finishWithdrawnTransaction
+                    : .markProviderSessionLost
             case .active:
                 return ownership == .inherited
                     ? .adoptCommittedSession
