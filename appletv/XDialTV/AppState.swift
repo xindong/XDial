@@ -546,7 +546,11 @@ final class AppState: ObservableObject {
     /// 「打开 XDial 后自动连接」。只决定启动后是否发起一次普通连接，不接管系统层的按需连接。
     /// 当前的「数据使用说明」版本。App Store 审核指南 5.4 要求 VPN App 在用户使用服务前
     /// 说明收集哪些数据、如何使用；用户确认之前不发起连接，也不做需要联网的自动判断。
+    #if os(iOS)
+    static let dataUseNoticeVersion = 6 // 后台网速新增定位用途。
+    #else
     static let dataUseNoticeVersion = 5
+    #endif
     @Published private(set) var dataUseNoticeAccepted: Bool
 
     func acceptDataUseNotice() {

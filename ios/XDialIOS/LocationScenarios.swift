@@ -71,7 +71,7 @@ final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDele
         manager.distanceFilter = 50
         manager.pausesLocationUpdatesAutomatically = false
         manager.showsBackgroundLocationIndicator = true
-        app.engine.statusPublisher.combineLatest(app.$profile)
+        app.engine.statusPublisher.combineLatest(app.$profile, app.$dataUseNoticeAccepted)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.reconcile() }
             .store(in: &subscriptions)
