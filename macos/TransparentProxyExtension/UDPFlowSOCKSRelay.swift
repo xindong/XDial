@@ -292,11 +292,7 @@ enum UDPFlowSOCKSRelay {
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) async -> AssociationOutcome {
-        guard
-            let socksPort = Network.NWEndpoint.Port(
-                rawValue: ticket.socksPort
-            )
-        else {
+        guard ticket.socksPort != 0 else {
             ticket.finish()
             return .associationEnded(
                 stage: "control-connect",
@@ -304,10 +300,9 @@ enum UDPFlowSOCKSRelay {
                 duration: 0
             )
         }
-        let control = NWConnection(
-            host: .ipv4(IPv4Address.loopback),
-            port: socksPort,
-            using: .tcp
+        let control = RelaySocket(
+            kind: .stream,
+            endpoint: .loopbackIPv4(port: ticket.socksPort)
         )
         let association = UDPAssociation(
             control: control,
@@ -365,7 +360,7 @@ enum UDPFlowSOCKSRelay {
     private static func establish(
         channel: UDPFlowChannel,
         association: UDPAssociation,
-        control: NWConnection,
+        control: RelaySocket,
         ticket: AssociationTicket,
         shutdown: RelayTaskShutdown,
         traffic: ProviderTrafficLedger,
@@ -374,7 +369,7 @@ enum UDPFlowSOCKSRelay {
         var stage = "control-connect"
         var healthClock = RelayAssociationHealthClock()
         do {
-            try await start(control)
+            try await control.connect()
             stage = "udp-associate"
             let boundInterface: String?
             if channel.flow.isBound {
@@ -394,12 +389,12 @@ enum UDPFlowSOCKSRelay {
                 boundInterface: boundInterface
             )
             stage = "relay-connect"
-            let datagramConnection = NWConnection(
-                to: relayEndpoint,
-                using: .udp
+            let datagramConnection = RelaySocket(
+                kind: .datagram,
+                endpoint: relayEndpoint
             )
             association.install(datagram: datagramConnection)
-            try await start(datagramConnection)
+            try await datagramConnection.connect()
             if let boundInterface {
                 // sing 的 SOCKS 服务端丢弃 UDP ASSOCIATE 的请求地址，只把首个
                 // 数据报的目标交给处理器。先发一个标记包携带绑定接口，sing-box
@@ -553,10 +548,10 @@ enum UDPFlowSOCKSRelay {
     }
 
     private static func associateUDP(
-        _ connection: NWConnection,
+        _ connection: RelaySocket,
         credentials: SOCKSCredentials?,
         boundInterface: String?
-    ) async throws -> Network.NWEndpoint {
+    ) async throws -> RelaySocket.Endpoint {
         let method: UInt8 = credentials == nil ? 0x00 : 0x02
         try await send(Data([0x05, 0x01, method]), to: connection)
         let greeting = try await receiveExactly(2, from: connection)
@@ -591,49 +586,34 @@ enum UDPFlowSOCKSRelay {
         guard header[0] == 0x05, header[1] == 0x00 else {
             throw RelayError.socksProtocol("UDP associate rejected")
         }
-        let host: Network.NWEndpoint.Host
+        // sing-box answers with the numeric address it listens on; an
+        // unspecified address means "the address you reached me on".
+        let address: RelaySocket.Endpoint.Address
         switch header[3] {
         case 0x01:
             let raw = try await receiveExactly(4, from: connection)
-            if raw == Data([0, 0, 0, 0]) {
-                host = .ipv4(IPv4Address.loopback)
-            } else {
-                host = Network.NWEndpoint.Host(
-                    "\(raw[0]).\(raw[1]).\(raw[2]).\(raw[3])"
-                )
-            }
-        case 0x03:
-            let length = try await receiveExactly(1, from: connection)
-            let raw = try await receiveExactly(Int(length[0]), from: connection)
-            guard let name = String(data: raw, encoding: .utf8) else {
-                throw RelayError.socksProtocol("invalid relay hostname")
-            }
-            host = Network.NWEndpoint.Host(name)
+            address = raw == Data([0, 0, 0, 0])
+                ? .ipv4([127, 0, 0, 1])
+                : .ipv4(Array(raw))
         case 0x04:
             let raw = try await receiveExactly(16, from: connection)
-            guard let address = IPv6Address(raw) else {
-                throw RelayError.socksProtocol("invalid IPv6 relay address")
-            }
-            host = address == IPv6Address.any
-                ? .ipv6(IPv6Address.loopback)
-                : .ipv6(address)
+            address = raw == Data(count: 16)
+                ? .ipv6(Array(repeating: 0, count: 15) + [1])
+                : .ipv6(Array(raw))
         default:
             throw RelayError.socksProtocol("invalid relay address type")
         }
         let portData = try await receiveExactly(2, from: connection)
         let port = UInt16(portData[0]) << 8 | UInt16(portData[1])
-        guard
-            let relayPort = Network.NWEndpoint.Port(rawValue: port),
-            port != 0
-        else {
+        guard port != 0 else {
             throw RelayError.socksProtocol("invalid relay port")
         }
-        return .hostPort(host: host, port: relayPort)
+        return RelaySocket.Endpoint(address: address, port: port)
     }
 
     private static func authenticate(
         _ credentials: SOCKSCredentials,
-        connection: NWConnection
+        connection: RelaySocket
     ) async throws {
         let username = Array(credentials.username.utf8)
         let password = Array(credentials.password.utf8)
@@ -688,30 +668,19 @@ enum UDPFlowSOCKSRelay {
     /// A SOCKS UDP association exists only while its TCP control connection is
     /// alive. Any EOF, error, or unexpected payload invalidates the UDP relay.
     private static func monitorControl(
-        _ connection: NWConnection
+        _ connection: RelaySocket
     ) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            connection.receive(
-                minimumIncompleteLength: 1,
-                maximumLength: 1
-            ) { data, _, isComplete, error in
-                if let error {
-                    completion(.failure(error))
-                } else if let data, !data.isEmpty {
-                    completion(
-                        .failure(
-                            RelayError.socksProtocol(
-                                "unexpected UDP control payload"
-                            )
-                        )
-                    )
-                } else if isComplete {
-                    completion(.failure(RelayError.associationEnded))
-                } else {
-                    completion(.failure(RelayError.socksUnavailable))
-                }
-            }
+        let received = try await connection.receive(maximumLength: 1)
+        if let error = received.error {
+            throw error
         }
+        if !received.data.isEmpty {
+            throw RelayError.socksProtocol("unexpected UDP control payload")
+        }
+        if received.isComplete {
+            throw RelayError.associationEnded
+        }
+        throw RelayError.socksUnavailable
     }
 
     private static func open(_ flow: NEAppProxyFlow) async throws {
@@ -730,88 +699,37 @@ enum UDPFlowSOCKSRelay {
         }
     }
 
-    private static func start(_ connection: NWConnection) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            let gate = UDPRelayGate()
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if gate.take() {
-                        completion(.success(()))
-                    }
-                case let .failed(error):
-                    if gate.take() {
-                        completion(.failure(error))
-                    }
-                case .cancelled:
-                    if gate.take() {
-                        completion(.failure(RelayError.socksUnavailable))
-                    }
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .global(qos: .userInitiated))
-        }
-    }
-
     private static func send(
         _ data: Data,
-        to connection: NWConnection
+        to connection: RelaySocket
     ) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
-                }
-            })
-        }
+        try await connection.send(data)
     }
 
     private static func receiveExactly(
         _ length: Int,
-        from connection: NWConnection
+        from connection: RelaySocket
     ) async throws -> Data {
         var result = Data()
         while result.count < length {
-            let remaining = length - result.count
-            let chunk: Data = try await awaitRelayCallback { completion in
-                connection.receive(
-                    minimumIncompleteLength: 1,
-                    maximumLength: remaining
-                ) { data, _, _, error in
-                    if let error {
-                        completion(.failure(error))
-                    } else if let data, !data.isEmpty {
-                        completion(.success(data))
-                    } else {
-                        completion(.failure(RelayError.socksUnavailable))
-                    }
-                }
+            let chunk = try await connection.receive(
+                maximumLength: length - result.count
+            )
+            if let error = chunk.error {
+                throw error
             }
-            result.append(chunk)
+            guard !chunk.data.isEmpty else {
+                throw RelayError.socksUnavailable
+            }
+            result.append(chunk.data)
         }
         return result
     }
 
     private static func receiveMessage(
-        from connection: NWConnection
+        from connection: RelaySocket
     ) async throws -> Data {
-        try await awaitRelayCallback { completion in
-            connection.receiveMessage { data, _, isComplete, error in
-                if let error {
-                    completion(.failure(error))
-                } else if let data {
-                    completion(.success(data))
-                } else if isComplete {
-                    completion(.success(Data()))
-                } else {
-                    completion(.failure(RelayError.socksUnavailable))
-                }
-            }
-        }
+        try await connection.receiveDatagram()
     }
 
 }
@@ -843,26 +761,29 @@ private final class UDPAssociation: @unchecked Sendable {
     let generation: String
 
     private let lock = NSLock()
-    private let control: NWConnection
-    private var datagram: NWConnection?
+    private let control: RelaySocket
+    private var datagram: RelaySocket?
     private var torn = false
 
-    init(control: NWConnection, generation: String) {
+    init(control: RelaySocket, generation: String) {
         self.control = control
         self.generation = generation
     }
 
-    var datagramConnection: NWConnection? {
+    var datagramConnection: RelaySocket? {
         lock.lock()
         defer { lock.unlock() }
         return torn ? nil : datagram
     }
 
-    func install(datagram: NWConnection) {
+    func install(datagram: RelaySocket) {
         lock.lock()
         if torn {
             lock.unlock()
-            datagram.forceCancel()
+            RelayConnectionCancellation.cancel(
+                datagram,
+                error: AppProxyFlowCloseError.aborted
+            )
             return
         }
         self.datagram = datagram

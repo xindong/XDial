@@ -3,6 +3,95 @@ import Network
 @preconcurrency import NetworkExtension
 import OSLog
 
+/// The byte-stream operations the SOCKS client and relay loop need. Captured
+/// flows reach sing-box over `RelaySocket`; the LAN share listener still
+/// speaks to its own clients and upstream through `NWConnection`.
+protocol SOCKSRelayStream: AnyObject {
+    func relaySend(_ data: Data) async throws
+    func relayFinishSending() async throws
+    func relayReceive(
+        maximumLength: Int
+    ) async throws -> TCPFlowSOCKSRelay.ReceiveResult
+}
+
+extension RelaySocket: SOCKSRelayStream {
+    func relaySend(_ data: Data) async throws {
+        try await send(data)
+    }
+
+    func relayFinishSending() async throws {
+        try await finishSending()
+    }
+
+    func relayReceive(
+        maximumLength: Int
+    ) async throws -> TCPFlowSOCKSRelay.ReceiveResult {
+        let received = try await receive(maximumLength: maximumLength)
+        return TCPFlowSOCKSRelay.ReceiveResult(
+            data: received.data,
+            isComplete: received.isComplete,
+            error: received.error
+        )
+    }
+}
+
+extension NWConnection: SOCKSRelayStream {
+    func relaySend(_ data: Data) async throws {
+        let _: Void = try await awaitRelayCallback { completion in
+            self.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(()))
+                }
+            })
+        }
+    }
+
+    /// Network framework documents a final, complete send as the TCP FIN
+    /// equivalent; the receive side stays open until its own EOF or error.
+    func relayFinishSending() async throws {
+        let _: Void = try await awaitRelayCallback { completion in
+            self.send(
+                content: nil,
+                contentContext: .finalMessage,
+                isComplete: true,
+                completion: .contentProcessed { error in
+                    if let error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+            )
+        }
+    }
+
+    func relayReceive(
+        maximumLength: Int
+    ) async throws -> TCPFlowSOCKSRelay.ReceiveResult {
+        try await awaitRelayCallback { completion in
+            self.receive(
+                minimumIncompleteLength: 1,
+                maximumLength: maximumLength
+            ) { data, _, isComplete, error in
+                // Network.framework may deliver the final bytes together with
+                // either FIN or an error. Preserve those bytes before applying
+                // the terminal state; dropping them corrupts the stream tail.
+                completion(
+                    .success(
+                        TCPFlowSOCKSRelay.ReceiveResult(
+                            data: data ?? Data(),
+                            isComplete: isComplete,
+                            error: error
+                        )
+                    )
+                )
+            }
+        }
+    }
+}
+
 enum TCPFlowSOCKSRelay {
     private struct RelayDestination {
         let host: String
@@ -26,10 +115,9 @@ enum TCPFlowSOCKSRelay {
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) -> ProviderRelayHandle {
-        let connection = NWConnection(
-            host: .ipv4(IPv4Address.loopback),
-            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-            using: .tcp
+        let connection = RelaySocket(
+            kind: .stream,
+            endpoint: .loopbackIPv4(port: socksPort)
         )
         let resources = TCPRelayResources(
             flow: flow,
@@ -46,7 +134,7 @@ enum TCPFlowSOCKSRelay {
                     do {
                         let destination = try destination(for: flow)
                         stage = "control-connect"
-                        try await start(connection)
+                        try await connection.connect()
                         stage = "socks-negotiate"
                         try await negotiateSOCKS(
                             connection,
@@ -205,7 +293,7 @@ enum TCPFlowSOCKSRelay {
     }
 
     static func negotiateSOCKS(
-        _ connection: NWConnection,
+        _ connection: some SOCKSRelayStream,
         credentials: SOCKSCredentials?,
         host: String,
         port: UInt16,
@@ -274,7 +362,7 @@ enum TCPFlowSOCKSRelay {
 
     private static func authenticate(
         _ credentials: SOCKSCredentials,
-        connection: NWConnection
+        connection: some SOCKSRelayStream
     ) async throws {
         let username = Array(credentials.username.utf8)
         let password = Array(credentials.password.utf8)
@@ -315,7 +403,7 @@ enum TCPFlowSOCKSRelay {
 
     private static func relay(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection,
+        connection: RelaySocket,
         resources: TCPRelayResources,
         shutdown: RelayTaskShutdown,
         transactionID: String,
@@ -363,26 +451,10 @@ enum TCPFlowSOCKSRelay {
         )
     }
 
-    /// Marks the SOCKS TCP stream complete in the sending direction. Network
-    /// framework documents this as the TCP FIN equivalent; the receive side
-    /// remains available until its own EOF or an error.
     static func finishSending(
-        to connection: NWConnection
+        to connection: some SOCKSRelayStream
     ) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            connection.send(
-                content: nil,
-                contentContext: .finalMessage,
-                isComplete: true,
-                completion: .contentProcessed { error in
-                    if let error {
-                        completion(.failure(error))
-                    } else {
-                        completion(.success(()))
-                    }
-                }
-            )
-        }
+        try await connection.relayFinishSending()
     }
 
     private static func read(from flow: NEAppProxyTCPFlow) async throws -> Data {
@@ -422,17 +494,9 @@ enum TCPFlowSOCKSRelay {
 
     static func send(
         _ data: Data,
-        to connection: NWConnection
+        to connection: some SOCKSRelayStream
     ) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
-                }
-            })
-        }
+        try await connection.relaySend(data)
     }
 
     struct ReceiveResult {
@@ -442,51 +506,27 @@ enum TCPFlowSOCKSRelay {
     }
 
     static func receive(
-        from connection: NWConnection
+        from connection: some SOCKSRelayStream
     ) async throws -> ReceiveResult {
-        try await awaitRelayCallback { completion in
-            connection.receive(
-                minimumIncompleteLength: 1,
-                maximumLength: 64 * 1024
-            ) { data, _, isComplete, error in
-                // Network.framework may deliver the final bytes together with
-                // either FIN or an error. Preserve those bytes before applying
-                // the terminal state; dropping them corrupts the stream tail.
-                completion(
-                    .success(
-                        ReceiveResult(
-                            data: data ?? Data(),
-                            isComplete: isComplete,
-                            error: error
-                        )
-                    )
-                )
-            }
-        }
+        try await connection.relayReceive(maximumLength: 64 * 1024)
     }
 
     static func receiveExactly(
         _ length: Int,
-        from connection: NWConnection
+        from connection: some SOCKSRelayStream
     ) async throws -> Data {
         var result = Data()
         while result.count < length {
-            let remaining = length - result.count
-            let chunk: Data = try await awaitRelayCallback { completion in
-                connection.receive(
-                    minimumIncompleteLength: 1,
-                    maximumLength: remaining
-                ) { data, _, _, error in
-                    if let error {
-                        completion(.failure(error))
-                    } else if let data, !data.isEmpty {
-                        completion(.success(data))
-                    } else {
-                        completion(.failure(RelayError.socksUnavailable))
-                    }
-                }
+            let chunk = try await connection.relayReceive(
+                maximumLength: length - result.count
+            )
+            if let error = chunk.error {
+                throw error
             }
-            result.append(chunk)
+            guard !chunk.data.isEmpty else {
+                throw RelayError.socksUnavailable
+            }
+            result.append(chunk.data)
         }
         return result
     }
@@ -496,14 +536,14 @@ enum TCPFlowSOCKSRelay {
 private final class TCPRelayResources: @unchecked Sendable {
     private let lock = NSLock()
     private let flow: NEAppProxyTCPFlow
-    private let connection: NWConnection
+    private let connection: RelaySocket
     private var flowReadClosed = false
     private var flowWriteClosed = false
     private var closed = false
 
     init(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection
+        connection: RelaySocket
     ) {
         self.flow = flow
         self.connection = connection
