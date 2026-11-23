@@ -6,7 +6,9 @@ import XCTest
 final class HomeViewUITests: XCTestCase {
     #if targetEnvironment(simulator)
     func testBackgroundSpeedIsOptionalAndRemembered() {
-        let app = launchApp()
+        let fresh = XCUIApplication()
+        fresh.resetAuthorizationStatus(for: .location)
+        let app = launchApp(extraArguments: ["-XDialUITestingLocation"])
         app.buttons["home-settings"].tap()
         let display = app.switches["settings-live-activity"]
         let speed = app.switches["settings-background-speed"]
@@ -15,6 +17,11 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertEqual(speed.value as? String, "0")
         let toggle = CGVector(dx: 0.9, dy: 0.5)
         speed.coordinate(withNormalizedOffset: toggle).tap()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.buttons.matching(NSPredicate(format: "label IN %@",
+            ["Allow While Using App", "While Using the App", "使用 App 时允许", "使用App时允许"])).firstMatch
+        XCTAssertTrue(allow.waitForExistence(timeout: 6), springboard.debugDescription)
+        allow.tap()
         XCTAssertEqual(speed.value as? String, "1")
         display.coordinate(withNormalizedOffset: toggle).tap()
         XCTAssertFalse(speed.isEnabled)

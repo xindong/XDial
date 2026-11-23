@@ -47,8 +47,21 @@ final class ConnectionActivityController {
     /// 退出允许采样的状态时取消整个任务，恢复后用两个新样本计算速率。
     func refreshSampling() {
         guard shouldSample else {
-            sampler?.cancel()
+            guard let stopped = sampler else { return }
+            stopped.cancel()
             sampler = nil
+            let previous = queue
+            queue = Task { [weak self] in
+                await previous?.value
+                await stopped.value
+                // A stale date alone may leave the compact island showing its last number.
+                for activity in Activity<XDialConnectionAttributes>.activities {
+                    guard let self, !self.shouldSample else { return }
+                    let state = activity.content.state
+                    guard state.speedSampledAt != nil else { continue }
+                    await activity.update(ActivityContent(state: state.clearingSpeed(), staleDate: nil))
+                }
+            }
             return
         }
         guard sampler == nil else { return }
@@ -60,14 +73,14 @@ final class ConnectionActivityController {
                 try? await Task.sleep(for: .seconds(2))
                 guard let self, !Task.isCancelled else { return }
                 guard self.shouldSample else {
-                    self.sampler = nil
+                    self.refreshSampling()
                     return
                 }
                 let start = self.app.engine.connectedAt
                 let totals = await self.app.trafficTotals()
                 guard !Task.isCancelled else { return }
                 guard self.shouldSample else {
-                    self.sampler = nil
+                    self.refreshSampling()
                     return
                 }
                 let now = Date()

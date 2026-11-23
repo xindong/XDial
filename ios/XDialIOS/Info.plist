@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>XDial uses your location to match saved places and switch VPN scenarios, including while connected in the background.</string>
+	<string>When you enable background speed updates or switching scenarios at saved places, XDial uses location in the background while the VPN is connected.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

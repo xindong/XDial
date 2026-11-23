@@ -40,13 +40,17 @@ extension XDialConnectionAttributes.ContentState {
 
     func displayed(isStale: Bool, at now: Date = Date()) -> Self {
         guard !isStale, let expiry = speedExpiresAt, expiry > now else {
-            var copy = self
-            copy.downloadBytesPerSecond = nil
-            copy.uploadBytesPerSecond = nil
-            copy.speedSampledAt = nil
-            return copy
+            return clearingSpeed()
         }
         return self
+    }
+
+    func clearingSpeed() -> Self {
+        var copy = self
+        copy.downloadBytesPerSecond = nil
+        copy.uploadBytesPerSecond = nil
+        copy.speedSampledAt = nil
+        return copy
     }
 
     /// 灵动岛收起时，一个方向的网速到这个数才值得占地方；再小只是零星的后台流量。

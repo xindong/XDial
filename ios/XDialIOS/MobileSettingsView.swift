@@ -6,6 +6,7 @@ struct MobileSettingsView: View {
     /// 为 true 时，打开后直接弹出「导入配置」并复位。用绑定读取弹出时的当前值。
     var startsImport: Binding<Bool>? = nil
 
+    @ObservedObject private var location = LocationScenarios.shared
     @State private var timelineSnapshot: ConnectionTimeline.File?
     @State private var exportDocument: MobileJSONDocument?
     @State private var isExporting = false
@@ -73,21 +74,26 @@ struct MobileSettingsView: View {
                         isOn: $showsLiveActivity
                     )
                     .onChange(of: showsLiveActivity) { _, _ in
+                        location.reconcile()
                         MobileAppRuntime.connectionActivity?.preferenceChanged()
                     }
                     .accessibilityIdentifier("settings-live-activity")
                     Toggle(isOn: $updatesBackgroundSpeed) {
                         Text(app.tr("在后台持续更新网络速度", "Keep network speed updated in the background"))
                         Text(app.tr(
-                            "地点场景定位期间可持续刷新，可能增加耗电。iOS 挂起 XDial 后会暂停刷新。",
-                            "Speeds can keep updating while location scenarios are active, using more battery. Updates pause when iOS suspends XDial."
+                            "连接 VPN 时使用后台定位，尽量保持网速更新，可能增加耗电。无需设置地点场景。",
+                            "Uses background location while the VPN is connected to keep speeds updating when possible. This may use more battery. No saved places are needed."
                         ))
                     }
                     .disabled(!showsLiveActivity)
                     .onChange(of: updatesBackgroundSpeed) { _, _ in
+                        location.reconcile()
                         MobileAppRuntime.connectionActivity?.refreshSampling()
                     }
                     .accessibilityIdentifier("settings-background-speed")
+                    if showsLiveActivity && updatesBackgroundSpeed && (location.authorization == .denied || location.authorization == .restricted) {
+                        Text(app.tr("后台网速需要定位权限。请在系统设置中允许 XDial 使用位置。", "To keep speeds updating in the background, allow location access for XDial in Settings."))
+                    }
                     NavigationLink(app.tr("地点场景", "Location scenarios")) { LocationScenarioSettings() }
                         .accessibilityIdentifier("settings-place-scenarios")
                     if showsSystemOnDemandStatus {
