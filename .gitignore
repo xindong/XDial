@@ -5,10 +5,9 @@ macos/.build/
 *.log
 *.profraw
 __pycache__/
-# .claude 下只提交 settings.json 和 hooks/，其余（worktrees/settings.local.json 等）本地私有
-.claude/*
-!.claude/settings.json
-!.claude/hooks/
+# AI 工具的本地配置（settings.local.json、worktrees 等）不进仓库
+.claude/
+.codex/
 /libboxtest
 /xdial
 appletv/XDialTV.xcodeproj/

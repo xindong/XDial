@@ -99,7 +99,7 @@ jobs:
           cache: true
       - name: gofmt gate
         run: |
-          unformatted=$(gofmt -l core/ cmd/)
+          unformatted=$(gofmt -l core/ cmd/ tools/)
           if [ -n "$unformatted" ]; then
             echo "以下文件未 gofmt:" && echo "$unformatted" && exit 1
           fi
