@@ -245,7 +245,9 @@ mDNSResponder 在接管前建立的 querier、应用内置的解析器或接管�
 到达的范围。证书校验仍在应用与服务端之间完成。
 DEBUG 路由探针只返回本窗口内被纠正的 flow 数，不返回原地址或名字。
 
-connect-by-name UDP 在 SOCKS 边界保留域名；这不代表支持 unconnected 多目标 UDP 或 QUIC 迁移。
+macOS 透明代理支持同一 UDP 套接字访问多个目标。SOCKS 入口按目标地址和端口分别建立转发，
+由 sing-box 匹配规则，同一目标复用已有转发。各目标沿用应用身份和绑定接口，回包携带对应来源。
+系统提供的 flow 域名仅用于初始目标。跨 Line 的 NAT 映射和 QUIC 连接迁移仍由各出口决定。
 
 入口：[地址核对补丁](patches/sing-box/0017-correct-flow-address-from-matched-line.patch)、
 [生成器标记](core/config/generator.go)（`markLineOwnedFlowAddressCorrection`）。

@@ -16,21 +16,17 @@ enum UDPRelayDatagramError: Error, Equatable {
 /// `writeDatagrams` rejects a `.name` host — it demands a concrete endpoint and
 /// otherwise fails the whole flow with `invalidArgument`.
 ///
-/// The codec therefore remembers which endpoint each encoded name stands for
-/// and returns the reply as the endpoint the application is actually talking
-/// to. A name it has never sent to resolves to the flow's last destination, and
-/// failing that the datagram is dropped — never surfaced as a `.name` host.
+/// The flow's hostname belongs to the initial endpoint. Later destinations on
+/// an unconnected socket must keep their own address for routing and replies.
 final class UDPRelayDatagramCodec: @unchecked Sendable {
-    /// One flow addresses very few names; the bound only stops a pathological
-    /// sender from growing the map without limit.
-    private static let maximumTrackedNames = 8
-
     private let lock = NSLock()
-    private var endpointsByName: [String: Network.NWEndpoint] = [:]
-    private var trackedNames: [String] = []
-    private var lastDestination: Network.NWEndpoint?
+    private var initialDestination: Network.NWEndpoint?
+    private var initialName: String?
+    private var hasMultipleDestinations = false
 
-    init() {}
+    init(initialDestination: Network.NWEndpoint? = nil) {
+        self.initialDestination = initialDestination
+    }
 
     func encode(
         payload: Data,
@@ -40,11 +36,20 @@ final class UDPRelayDatagramCodec: @unchecked Sendable {
         guard case let .hostPort(host, port) = destination else {
             throw UDPRelayDatagramError.invalidDestination
         }
-        let socksHost = TransparentProxyFlowMetadata.datagramSOCKSHost(
-            hostname: remoteHostname,
-            endpointHost: host,
-            endpointPort: port
-        )
+        let socksHost = lock.withLock {
+            if initialDestination == nil { initialDestination = destination }
+            let isInitial = initialDestination == destination
+            if !isInitial { hasMultipleDestinations = true }
+            let target = TransparentProxyFlowMetadata.datagramSOCKSHost(
+                hostname: isInitial ? remoteHostname : nil,
+                endpointHost: host,
+                endpointPort: port
+            )
+            if isInitial, case let .name(name, _) = target {
+                initialName = name.lowercased()
+            }
+            return target
+        }
         var packet = Data([0x00, 0x00, 0x00])
         switch socksHost {
         case let .ipv4(address):
@@ -61,14 +66,12 @@ final class UDPRelayDatagramCodec: @unchecked Sendable {
             packet.append(0x03)
             packet.append(UInt8(raw.count))
             packet.append(contentsOf: raw)
-            rememberName(name, endpoint: destination)
         @unknown default:
             throw UDPRelayDatagramError.invalidDestination
         }
         packet.append(UInt8(port.rawValue >> 8))
         packet.append(UInt8(port.rawValue & 0xff))
         packet.append(payload)
-        noteDestination(destination)
         return packet
     }
 
@@ -163,38 +166,16 @@ final class UDPRelayDatagramCodec: @unchecked Sendable {
         return (payload, endpoint)
     }
 
-    private func rememberName(
-        _ name: String,
-        endpoint: Network.NWEndpoint
-    ) {
-        let key = name.lowercased()
-        lock.lock()
-        if endpointsByName.updateValue(endpoint, forKey: key) == nil {
-            trackedNames.append(key)
-            while trackedNames.count > Self.maximumTrackedNames {
-                let evicted = trackedNames.removeFirst()
-                endpointsByName.removeValue(forKey: evicted)
-            }
-        }
-        lock.unlock()
-    }
-
-    private func noteDestination(_ endpoint: Network.NWEndpoint) {
-        lock.lock()
-        lastDestination = endpoint
-        lock.unlock()
-    }
-
-    /// Domain replies are answered with the endpoint the application addressed.
-    /// The port comes from the reply so a server which answers from a different
-    /// port is still attributed to the destination the application knows.
     private func resolve(
         name: String,
         port: Network.NWEndpoint.Port
     ) -> Network.NWEndpoint? {
-        lock.lock()
-        let match = endpointsByName[name.lowercased()] ?? lastDestination
-        lock.unlock()
+        // Preserve the historical single-peer fallback only while unambiguous.
+        let match: Network.NWEndpoint? = lock.withLock {
+            guard !hasMultipleDestinations || name.lowercased() == initialName
+            else { return nil }
+            return initialDestination
+        }
         guard case let .hostPort(host, _) = match else {
             return nil
         }
