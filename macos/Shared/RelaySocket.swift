@@ -64,8 +64,8 @@ final class RelaySocket: @unchecked Sendable {
         let error: Error?
     }
 
-    /// Largest datagram sing-box can hand back: a full UDP payload plus the
-    /// SOCKS5 UDP request header with the longest domain form.
+    /// Buffer capacity for a UDP payload and the longest SOCKS5 header.
+    /// The kernel still enforces the IPv4 or IPv6 datagram size limit.
     static let maximumDatagramLength = 65_535 + 262
 
     private static let targetQueue = DispatchQueue.global(
@@ -130,6 +130,23 @@ final class RelaySocket: @unchecked Sendable {
             fd = -1
             creationError = errno
             return
+        }
+        if kind == .datagram {
+            // Darwin checks atomic writes against SO_SNDBUF. The default
+            // buffer is too small even for valid UDP datagrams.
+            var sendBufferSize = Int32(Self.maximumDatagramLength)
+            guard setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &sendBufferSize,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 else {
+                creationError = errno
+                fd = -1
+                Darwin.close(descriptor)
+                return
+            }
         }
         fd = descriptor
         creationError = 0

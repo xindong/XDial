@@ -165,14 +165,21 @@ final class RelaySocketTests: XCTestCase {
             kind: .datagram,
             endpoint: .loopbackIPv4(port: server.port)
         )
+        let deadline = DispatchWorkItem { socket.close(abortive: true) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: deadline)
+        defer {
+            deadline.cancel()
+            socket.close(abortive: true)
+        }
         try await socket.connect()
-        for size in [1, 512, 9_000] {
+        // Exercise the default Darwin send-buffer boundary and the largest
+        // IPv4 UDP payload, including any SOCKS header carried as UDP data.
+        for size in [1, 512, 9_000, 9_217, 65_507] {
             let payload = Data((0..<size).map { UInt8($0 % 199) })
             try await socket.send(payload)
             let reply = try await socket.receiveDatagram()
             XCTAssertEqual(reply, payload, "size=\(size)")
         }
-        socket.close(abortive: true)
     }
 
     /// Each relay owns one descriptor; a provider that leaked them would
@@ -363,7 +370,19 @@ private final class LoopbackUDPEcho: @unchecked Sendable {
     init() throws {
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { throw POSIXError(.EMFILE) }
-        port = try LoopbackTCPListener.bindLoopback(fd)
+        do {
+            var sendBufferSize = Int32(RelaySocket.maximumDatagramLength)
+            guard setsockopt(
+                fd, SOL_SOCKET, SO_SNDBUF,
+                &sendBufferSize, socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            port = try LoopbackTCPListener.bindLoopback(fd)
+        } catch {
+            close(fd)
+            throw error
+        }
         let fd = self.fd
         Thread.detachNewThread {
             var buffer = [UInt8](repeating: 0, count: 65_536)
