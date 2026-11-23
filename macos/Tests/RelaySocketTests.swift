@@ -116,6 +116,45 @@ final class RelaySocketTests: XCTestCase {
         socket.close(abortive: true)
     }
 
+    /// Each relay owns one descriptor; a provider that leaked them would
+    /// exhaust its table after enough flows.
+    func testClosedSocketsReleaseTheirDescriptors() async throws {
+        try raiseDescriptorLimit(to: 4096)
+        let baseline = openDescriptorCount()
+        let listener = try LoopbackTCPListener(echo: false)
+        let udp = try LoopbackUDPEcho()
+        var sockets: [RelaySocket] = []
+        for index in 0..<200 {
+            let datagram = index.isMultiple(of: 4)
+            let socket = RelaySocket(
+                kind: datagram ? .datagram : .stream,
+                endpoint: .loopbackIPv4(
+                    port: datagram ? udp.port : listener.port
+                )
+            )
+            try await socket.connect()
+            sockets.append(socket)
+        }
+        // A socket that never connected must release its descriptor too.
+        sockets.append(
+            RelaySocket(
+                kind: .stream,
+                endpoint: .loopbackIPv4(port: listener.port)
+            )
+        )
+        for (index, socket) in sockets.enumerated() {
+            socket.close(abortive: index.isMultiple(of: 2))
+        }
+        sockets.removeAll()
+        listener.stop()
+        udp.stop()
+        let deadline = Date().addingTimeInterval(5)
+        while openDescriptorCount() > baseline, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertLessThanOrEqual(openDescriptorCount(), baseline)
+    }
+
     func testEndpointDescription() {
         XCTAssertEqual(
             RelaySocket.Endpoint.loopbackIPv4(port: 1080).description,
@@ -128,6 +167,15 @@ final class RelaySocketTests: XCTestCase {
             ).description,
             "[0:0:0:0:0:0:0:1]:53"
         )
+    }
+
+    private func openDescriptorCount() -> Int {
+        var count = 0
+        for descriptor in 0..<getdtablesize()
+        where fcntl(descriptor, F_GETFD) != -1 {
+            count += 1
+        }
+        return count
     }
 
     private func raiseDescriptorLimit(to value: rlim_t) throws {
