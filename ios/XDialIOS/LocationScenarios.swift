@@ -28,7 +28,7 @@ struct ScenarioPlace: Codable, Equatable {
 @MainActor
 final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationScenarios()
-    private let manager = CLLocationManager()
+    private let manager: CLLocationManager
     // One-shot fixes do not disturb the continuous background location session.
     private let renewalManager = CLLocationManager()
     private var renewalTimer: Timer?
@@ -58,6 +58,11 @@ final class LocationScenarios: NSObject, ObservableObject, CLLocationManagerDele
     private var tracking = false
     private var requestedSpeedAuthorization = false
     private var saveTimeout: Task<Void, Never>?
+
+    init(manager: CLLocationManager = CLLocationManager()) {
+        self.manager = manager
+        super.init()
+    }
 
     func attach(_ app: AppState) {
         guard self.app == nil else { return }

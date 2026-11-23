@@ -1,4 +1,5 @@
 import Combine
+import CoreLocation
 import Security
 import UIKit
 import XCTest
@@ -3680,6 +3681,43 @@ final class DataUseNoticeTests: XCTestCase {
         app.connect()
         await Task.yield()
         XCTAssertEqual(manager.startCallCount, 1)
+    }
+
+    func testUpgradingWithAuthorizedBackgroundSpeedWaitsForNewNotice() async {
+        final class AuthorizedLocationManager: CLLocationManager {
+            override var authorizationStatus: CLAuthorizationStatus { .authorizedWhenInUse }
+            var onStart: (() -> Void)?
+            override func startUpdatingLocation() { onStart?() }
+        }
+
+        let defaults = UserDefaults.standard
+        let keys = [ConnectionActivityController.preferenceKey, ConnectionActivityController.backgroundSpeedKey]
+        let original = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, original) { defaults.set(value, forKey: key) } }
+        for key in keys { defaults.set(true, forKey: key) }
+
+        for previousVersion in [4, 5] {
+            let persistence = makePersistence(accepted: false)
+            persistence.defaults.set(previousVersion, forKey: persistence.dataUseNoticeKey)
+            let (app, engine, _) = makeApp(persistence)
+            engine.setStatus("connected")
+
+            let manager = AuthorizedLocationManager()
+            let location = LocationScenarios(manager: manager)
+            manager.onStart = { XCTFail("Started location before confirming the new notice") }
+            location.attach(app)
+            location.reconcile()
+            XCTAssertFalse(app.dataUseNoticeAccepted)
+            XCTAssertFalse(manager.allowsBackgroundLocationUpdates)
+            // Drain the initial status/profile delivery before testing the consent change alone.
+            await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } }
+            let started = expectation(description: "Start background location after confirmation")
+            manager.onStart = { started.fulfill() }
+            app.acceptDataUseNotice()
+            await fulfillment(of: [started], timeout: 3)
+            XCTAssertTrue(manager.allowsBackgroundLocationUpdates)
+            XCTAssertTrue(makeApp(persistence).0.dataUseNoticeAccepted)
+        }
     }
 
     func testConfirmationIsRememberedForTheCurrentVersion() {
