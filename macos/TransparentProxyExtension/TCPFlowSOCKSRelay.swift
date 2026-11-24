@@ -119,12 +119,13 @@ enum TCPFlowSOCKSRelay {
             kind: .stream,
             endpoint: .loopbackIPv4(port: socksPort)
         )
+        let flowID = UUID().uuidString
         let resources = TCPRelayResources(
             flow: flow,
             connection: connection
         )
         let shutdown = RelayTaskShutdown { error in
-            resources.close(with: error)
+            resources.close(with: (error as? FlowIOFailure)?.underlying ?? error)
         }
         return ProviderRelayHandle(
             shutdown: shutdown,
@@ -147,7 +148,7 @@ enum TCPFlowSOCKSRelay {
                         stage = "flow-open"
                         try await open(flow)
                         logger.debug(
-                            "relay-started trial=\(trialID, privacy: .public)"
+                            "relay-started trial=\(trialID, privacy: .public) flow=\(flowID, privacy: .public)"
                         )
                         stage = "relay"
                         try await relay(
@@ -156,20 +157,25 @@ enum TCPFlowSOCKSRelay {
                             resources: resources,
                             shutdown: shutdown,
                             transactionID: trialID,
+                            flowID: flowID,
+                            logger: logger,
                             traffic: traffic
                         )
                         logger.debug(
-                            "relay-finished trial=\(trialID, privacy: .public)"
+                            "relay-finished trial=\(trialID, privacy: .public) flow=\(flowID, privacy: .public)"
                         )
                         shutdown.finish(with: nil)
                     } catch {
-                        if isExpectedFlowClosure(error) {
+                        let failure = error as? FlowIOFailure
+                        let stage = failure?.stage ?? stage
+                        let cause = failure?.underlying ?? error
+                        if isExpectedFlowClosure(cause) {
                             logger.debug(
-                                "relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                                "relay-closed trial=\(trialID, privacy: .public) flow=\(flowID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(cause), privacy: .public)"
                             )
                         } else {
                             logger.error(
-                                "relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                                "relay-error trial=\(trialID, privacy: .public) flow=\(flowID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(cause), privacy: .public)"
                             )
                         }
                         shutdown.finish(with: error)
@@ -200,24 +206,8 @@ enum TCPFlowSOCKSRelay {
             return "socks-protocol"
         case RelayError.flowClosed:
             return "flow-closed"
-        case let networkError as NWError:
-            switch networkError {
-            case let .posix(code):
-                return "posix-\(code.rawValue)"
-            case let .dns(code):
-                return "dns-\(code)"
-            case let .tls(code):
-                return "tls-\(code)"
-#if compiler(>=6.2)
-            case .wifiAware:
-                return "wifi-aware"
-#endif
-            @unknown default:
-                return "network-unknown"
-            }
         default:
-            let nsError = error as NSError
-            return "ns-\(nsError.code)"
+            return RelaySystemDiagnostic.code(for: error)
         }
     }
 
@@ -401,12 +391,19 @@ enum TCPFlowSOCKSRelay {
         }
     }
 
+    private struct FlowIOFailure: Error {
+        let stage: String
+        let underlying: Error
+    }
+
     private static func relay(
         flow: NEAppProxyTCPFlow,
         connection: RelaySocket,
         resources: TCPRelayResources,
         shutdown: RelayTaskShutdown,
         transactionID: String,
+        flowID: String,
+        logger: Logger,
         traffic: ProviderTrafficLedger
     ) async throws {
         try await RelayTaskPair.run(
@@ -414,6 +411,7 @@ enum TCPFlowSOCKSRelay {
                 while !Task.isCancelled {
                     let data = try await read(from: flow)
                     if data.isEmpty {
+                        logger.debug("relay-eof trial=\(transactionID, privacy: .public) flow=\(flowID, privacy: .public) stage=flow-read")
                         resources.closeFlowRead()
                         try await finishSending(to: connection)
                         return
@@ -439,6 +437,7 @@ enum TCPFlowSOCKSRelay {
                         throw error
                     }
                     if result.isComplete {
+                        logger.debug("relay-eof trial=\(transactionID, privacy: .public) flow=\(flowID, privacy: .public) stage=upstream-read")
                         resources.closeFlowWrite()
                         return
                     }
@@ -465,7 +464,7 @@ enum TCPFlowSOCKSRelay {
                     return
                 }
                 if let error {
-                    completion(.failure(error))
+                    completion(.failure(FlowIOFailure(stage: "flow-read", underlying: error)))
                 } else {
                     completion(.success(data ?? Data()))
                 }
@@ -484,7 +483,7 @@ enum TCPFlowSOCKSRelay {
                     return
                 }
                 if let error {
-                    completion(.failure(error))
+                    completion(.failure(FlowIOFailure(stage: "flow-write", underlying: error)))
                 } else {
                     completion(.success(()))
                 }

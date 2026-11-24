@@ -13,6 +13,7 @@ targets:
     platform: macOS
     sources:
       - Extension
+      - ../../macos/Shared/RelaySystemDiagnostic.swift
       - ../../macos/TransparentProxyExtension/TCPFlowSOCKSRelay.swift
       - ../../macos/TransparentProxyExtension/UDPFlowSOCKSRelay.swift
       - ../../macos/TransparentProxyExtension/SOCKSCredentials.swift

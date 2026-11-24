@@ -97,11 +97,11 @@ enum UDPFlowSOCKSRelay {
         } catch {
             if isExpectedFlowClosure(error) {
                 logger.debug(
-                    "udp-relay-closed trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-relay-closed trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
                 )
             } else {
                 logger.error(
-                    "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-relay-error trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
                 )
             }
             initialTicket.finish()
@@ -135,7 +135,7 @@ enum UDPFlowSOCKSRelay {
             await group.waitForAll()
         }
         logger.debug(
-            "udp-relay-finished trial=\(trialID, privacy: .public)"
+            "udp-relay-finished trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public)"
         )
     }
 
@@ -177,7 +177,7 @@ enum UDPFlowSOCKSRelay {
                         )
                     } catch {
                         logger.debug(
-                            "udp-send-dropped trial=\(trialID, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                            "udp-send-dropped trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
                         )
                         continue
                     }
@@ -206,11 +206,11 @@ enum UDPFlowSOCKSRelay {
             }
             if isExpectedFlowClosure(error) {
                 logger.debug(
-                    "udp-relay-closed trial=\(trialID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-relay-closed trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
                 )
             } else {
                 logger.error(
-                    "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-relay-error trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
                 )
             }
             channel.close(with: error)
@@ -241,9 +241,13 @@ enum UDPFlowSOCKSRelay {
             }
             switch outcome {
             case let .flowEnded(stage, error):
-                if let error, !isExpectedFlowClosure(error) {
+                if let error, isExpectedFlowClosure(error) {
+                    logger.debug(
+                        "udp-relay-closed trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                    )
+                } else if let error {
                     logger.error(
-                        "udp-relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                        "udp-relay-error trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
                     )
                 }
                 channel.close(with: error)
@@ -255,7 +259,7 @@ enum UDPFlowSOCKSRelay {
                     )
                 else {
                     logger.error(
-                        "udp-relay-reassociate-exhausted trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt) code=\(diagnosticCode(error), privacy: .public)"
+                        "udp-relay-reassociate-exhausted trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt) code=\(diagnosticCode(error), privacy: .public)"
                     )
                     channel.close(
                         with: error ?? AppProxyFlowCloseError.aborted
@@ -273,13 +277,13 @@ enum UDPFlowSOCKSRelay {
                 }
                 guard let next = nextTicket() else {
                     logger.notice(
-                        "udp-relay-reassociate-unavailable trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt)"
+                        "udp-relay-reassociate-unavailable trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt)"
                     )
                     channel.close(with: AppProxyFlowCloseError.aborted)
                     return
                 }
                 logger.notice(
-                    "udp-relay-reassociate trial=\(trialID, privacy: .public) generation=\(next.generation, privacy: .public) attempt=\(budget.attempt) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-relay-reassociate trial=\(trialID, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) generation=\(next.generation, privacy: .public) attempt=\(budget.attempt) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
                 )
                 ticket = next
             }
@@ -419,7 +423,7 @@ enum UDPFlowSOCKSRelay {
             }
             healthClock.markReady()
             logger.debug(
-                "udp-relay-started trial=\(ticket.generation, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
+                "udp-relay-started trial=\(ticket.generation, privacy: .public) flow=\(channel.diagnosticID, privacy: .public)"
             )
             stage = "relay"
             try await RelayTaskGroup.run(
@@ -444,7 +448,7 @@ enum UDPFlowSOCKSRelay {
                 duration: healthClock.duration()
             )
         } catch let failure as FlowFailure {
-            return .flowEnded(stage: stage, error: failure.underlying)
+            return .flowEnded(stage: "flow-write", error: failure.underlying)
         } catch {
             return .associationEnded(
                 stage: stage,
@@ -475,13 +479,13 @@ enum UDPFlowSOCKSRelay {
                 // A single malformed datagram is not a reason to retire the
                 // association, let alone the application's socket.
                 logger.debug(
-                    "udp-receive-dropped trial=\(association.generation, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                    "udp-receive-dropped trial=\(association.generation, privacy: .public) flow=\(channel.diagnosticID, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
                 )
                 continue
             }
             guard let decoded else {
                 logger.debug(
-                    "udp-receive-unmapped trial=\(association.generation, privacy: .public)"
+                    "udp-receive-unmapped trial=\(association.generation, privacy: .public) flow=\(channel.diagnosticID, privacy: .public)"
                 )
                 continue
             }
@@ -532,24 +536,8 @@ enum UDPFlowSOCKSRelay {
             return "fragmented-datagram"
         case UDPRelayDatagramError.malformedPacket:
             return "socks-protocol"
-        case let networkError as NWError:
-            switch networkError {
-            case let .posix(code):
-                return "posix-\(code.rawValue)"
-            case let .dns(code):
-                return "dns-\(code)"
-            case let .tls(code):
-                return "tls-\(code)"
-#if compiler(>=6.2)
-            case .wifiAware:
-                return "wifi-aware"
-#endif
-            @unknown default:
-                return "network-unknown"
-            }
         default:
-            let nsError = error as NSError
-            return "ns-\(nsError.code)"
+            return RelaySystemDiagnostic.code(for: error)
         }
     }
 
@@ -824,6 +812,7 @@ private final class UDPAssociation: @unchecked Sendable {
 /// Owns the application-facing flow across every association it outlives.
 private final class UDPFlowChannel: @unchecked Sendable {
     let flow: NEAppProxyUDPFlow
+    let diagnosticID = UUID().uuidString
     let codec: UDPRelayDatagramCodec
 
     private let associationSlot = RelayAssociationSlot<UDPAssociation>()
