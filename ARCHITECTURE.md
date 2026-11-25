@@ -247,6 +247,9 @@ DEBUG 路由探针只返回本窗口内被纠正的 flow 数，不返回原地�
 
 macOS 透明代理支持同一 UDP 套接字访问多个目标。SOCKS 入口按目标地址和端口分别建立转发，
 由 sing-box 匹配规则，同一目标复用已有转发。各目标沿用应用身份和绑定接口，回包携带对应来源。
+同一 UDP 关联内命中同一 Direct 出口、同一绑定接口与同一地址族的非连接目标共享同一个底层
+未连接 UDP 套接字，保持 Endpoint-Independent Mapping（Full-Cone NAT 语义），并将该套接字
+收到的任意远端回包按原来源送回该关联；命中不同出口的目标仍独立转发、互不串路。
 系统提供的 flow 域名仅用于初始目标。跨 Line 的 NAT 映射和 QUIC 连接迁移仍由各出口决定。
 
 入口：[地址核对补丁](patches/sing-box/0017-correct-flow-address-from-matched-line.patch)、

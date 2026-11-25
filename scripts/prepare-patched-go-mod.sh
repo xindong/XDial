@@ -277,6 +277,12 @@ grep -Fq 'func TestXDialOriginalUDPExchangePreservesWireRequestAndTarget(' \
 	"${patched_sing_box_dir}/dns/transport/local/local_darwin_test.go"
 grep -Fq 'options.DisableCache = true' \
 	"${patched_sing_box_dir}/dns/client.go"
+grep -Fq 'func XDialDirectPacketPoolFromContext(' \
+	"${patched_sing_box_dir}/adapter/xdial_udp_pool.go"
+grep -Fq 'newXDialDirectPacketPool(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_udp.go"
+grep -Fq 'func TestXDialDirectPacketPoolSharesSingleSocketAcrossPeers(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_udp_pool_test.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"
