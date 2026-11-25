@@ -39,6 +39,7 @@ final class EmbeddedSingBoxRuntime {
         /// They never enter ConnectionPlan, reports, logs, or diagnostics.
         let lineRuntimeIdentities: [String: String]
         let ruleSetTags: Set<String>
+        let directExcludedNetworks: [TransparentProxyRemoteNetwork]
         let dnsCaptureDomains: [String]
         let tailscaleDNSRecordCount: Int
         /// The process-singleton AnyConnect capability held by this complete
@@ -117,6 +118,7 @@ final class EmbeddedSingBoxRuntime {
         let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
         let applicationProcessCredentials: [ApplicationProcessCredential]?
+        var directExcludedNetworks: [TransparentProxyRemoteNetwork]?
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
 
@@ -128,6 +130,7 @@ final class EmbeddedSingBoxRuntime {
             case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
             case applicationProcessCredentials = "application_process_credentials"
+            case directExcludedNetworks = "direct_excluded_networks"
             case anyConnect = "anyconnect"
             case tailscale
         }
@@ -642,6 +645,8 @@ final class EmbeddedSingBoxRuntime {
                 lineRuntimeIdentities:
                     finalEnvelope.lineRuntimeIdentities,
                 ruleSetTags: Set(finalEnvelope.ruleSetTags),
+                directExcludedNetworks:
+                    finalEnvelope.directExcludedNetworks ?? [],
                 dnsCaptureDomains:
                     finalReadiness.preparedTailscaleDNS?
                         .captureDomains ?? [],
@@ -905,6 +910,8 @@ final class EmbeddedSingBoxRuntime {
                 lineRuntimeIdentities:
                     finalEnvelope.lineRuntimeIdentities,
                 ruleSetTags: Set(finalEnvelope.ruleSetTags),
+                directExcludedNetworks:
+                    finalEnvelope.directExcludedNetworks ?? [],
                 dnsCaptureDomains:
                     finalReadiness.preparedTailscaleDNS?
                         .captureDomains ?? [],
@@ -1390,6 +1397,13 @@ final class EmbeddedSingBoxRuntime {
             }) ?? true
         else {
             throw RuntimeError.invalidSessionEnvelope
+        }
+        if let rawDirectExcludedNetworks = envelope.directExcludedNetworks {
+            guard let validated = try? TransparentProxyNetworkRulePlan
+                .validateDirectExcludedNetworks(rawDirectExcludedNetworks) else {
+                throw RuntimeError.invalidSessionEnvelope
+            }
+            envelope.directExcludedNetworks = validated
         }
         envelope.rawJSON = envelopeJSON
         return envelope

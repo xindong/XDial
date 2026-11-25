@@ -427,7 +427,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
                 }
                 let settings = self.networkSettings(for: session)
                 self.logger.notice(
-                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public) tailscale-records=\(session.tailscaleDNSRecordCount, privacy: .public) interface-scoped-exclusions=\(TransparentProxyNetworkRulePlan.interfaceScopedRemoteNetworks.count, privacy: .public)"
+                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public) tailscale-records=\(session.tailscaleDNSRecordCount, privacy: .public) interface-scoped-exclusions=\(TransparentProxyNetworkRulePlan.interfaceScopedRemoteNetworks.count, privacy: .public) direct-exclusions=\(session.directExcludedNetworks.count, privacy: .public)"
                 )
                 let commitID = UUID()
                 let replacedRelays = self.relayRegistry.activate(
@@ -1876,7 +1876,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
             completionHandler: completionHandler
         )
         logger.notice(
-            "scenario-switch-committed generation=\(self.generation, privacy: .public)"
+            "scenario-switch-committed generation=\(self.generation, privacy: .public) direct-exclusions=\(prepared.session.directExcludedNetworks.count, privacy: .public)"
         )
     }
 
@@ -2058,7 +2058,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
             ),
         ]
         settings.excludedNetworkRules =
-            TransparentProxyNetworkRulePlan.interfaceScopedRemoteNetworks.map {
+            TransparentProxyNetworkRulePlan.excludedRemoteNetworks(
+                directExcludedNetworks: session.directExcludedNetworks
+            ).map {
                 network in
                 NENetworkRule(
                     remoteNetworkEndpoint: .hostPort(
