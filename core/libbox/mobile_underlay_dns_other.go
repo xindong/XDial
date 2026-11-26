@@ -5,6 +5,8 @@ package libbox
 import (
 	"context"
 	"time"
+
+	mDNS "github.com/miekg/dns"
 )
 
 func mobileUnderlayUsesNativeScopedResolver() bool {
@@ -14,8 +16,7 @@ func mobileUnderlayUsesNativeScopedResolver() bool {
 func darwinScopedDNSServiceLookup(
 	_ context.Context,
 	_ int,
-	_ string,
-	_ uint16,
+	_ mDNS.Question,
 	_ time.Duration,
 ) (underlayLookupResult, error) {
 	return underlayLookupResult{}, errMobileUnderlayDNSUnavailable

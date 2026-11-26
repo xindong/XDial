@@ -17,16 +17,14 @@ import (
 
 func TestMobileUnderlayDNSScopesQueriesToDefaultInterface(t *testing.T) {
 	var gotInterfaceIndex int
-	var gotName string
-	var gotQtype uint16
+	var gotQuestion mDNS.Question
 
 	transport := &mobileUnderlayDNSTransport{
 		TransportAdapter: boxDNS.NewTransportAdapter(typeMobileUnderlayDNS, "xdial-direct-dns", nil),
 		interfaceIndex:   func() int { return 7 },
-		lookup: func(_ context.Context, interfaceIndex int, name string, qtype uint16, _ time.Duration) (underlayLookupResult, error) {
+		lookup: func(_ context.Context, interfaceIndex int, question mDNS.Question, _ time.Duration) (underlayLookupResult, error) {
 			gotInterfaceIndex = interfaceIndex
-			gotName = name
-			gotQtype = qtype
+			gotQuestion = question
 			return underlayLookupResult{
 				addresses: []netip.Addr{netip.MustParseAddr("198.51.100.10")},
 				ttl:       42,
@@ -40,8 +38,8 @@ func TestMobileUnderlayDNSScopesQueriesToDefaultInterface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Exchange failed: %v", err)
 	}
-	if gotInterfaceIndex != 7 || gotName != "cdn.example.com." || gotQtype != mDNS.TypeA {
-		t.Fatalf("unexpected lookup args: if=%d name=%q qtype=%d", gotInterfaceIndex, gotName, gotQtype)
+	if gotInterfaceIndex != 7 || gotQuestion != req.Question[0] {
+		t.Fatalf("unexpected lookup args: if=%d question=%v", gotInterfaceIndex, gotQuestion)
 	}
 	if resp.Rcode != mDNS.RcodeSuccess || len(resp.Answer) != 1 {
 		t.Fatalf("unexpected DNS response: %v", resp)
@@ -57,7 +55,7 @@ func TestMobileUnderlayDNSFailsClosedWithoutValidInterface(t *testing.T) {
 	transport := &mobileUnderlayDNSTransport{
 		TransportAdapter: boxDNS.NewTransportAdapter(typeMobileUnderlayDNS, "xdial-direct-dns", nil),
 		interfaceIndex:   func() int { return 0 },
-		lookup: func(_ context.Context, _ int, _ string, _ uint16, _ time.Duration) (underlayLookupResult, error) {
+		lookup: func(_ context.Context, _ int, _ mDNS.Question, _ time.Duration) (underlayLookupResult, error) {
 			called = true
 			return underlayLookupResult{}, nil
 		},
@@ -73,7 +71,7 @@ func TestMobileUnderlayDNSFailsClosedWithoutValidInterface(t *testing.T) {
 	}
 }
 
-func TestMobileUnderlayDNSStatusAndNonAddressTypes(t *testing.T) {
+func TestMobileUnderlayDNSNegativeStatuses(t *testing.T) {
 	cases := []struct {
 		name      string
 		qtype     uint16
@@ -82,7 +80,7 @@ func TestMobileUnderlayDNSStatusAndNonAddressTypes(t *testing.T) {
 	}{
 		{
 			name:      "no-data stays NOERROR empty",
-			qtype:     mDNS.TypeAAAA,
+			qtype:     mDNS.TypeHTTPS,
 			lookupErr: errMobileUnderlayDNSNoData,
 			wantRcode: mDNS.RcodeSuccess,
 		},
@@ -92,12 +90,6 @@ func TestMobileUnderlayDNSStatusAndNonAddressTypes(t *testing.T) {
 			lookupErr: boxDNS.RcodeError(mDNS.RcodeNameError),
 			wantRcode: mDNS.RcodeNameError,
 		},
-		{
-			name:      "non-A/AAAA returns NOERROR empty without lookup",
-			qtype:     mDNS.TypeHTTPS,
-			lookupErr: errors.New("must not be called"),
-			wantRcode: mDNS.RcodeSuccess,
-		},
 	}
 
 	for _, tc := range cases {
@@ -105,7 +97,7 @@ func TestMobileUnderlayDNSStatusAndNonAddressTypes(t *testing.T) {
 			transport := &mobileUnderlayDNSTransport{
 				TransportAdapter: boxDNS.NewTransportAdapter(typeMobileUnderlayDNS, "xdial-direct-dns", nil),
 				interfaceIndex:   func() int { return 7 },
-				lookup: func(_ context.Context, _ int, _ string, _ uint16, _ time.Duration) (underlayLookupResult, error) {
+				lookup: func(_ context.Context, _ int, _ mDNS.Question, _ time.Duration) (underlayLookupResult, error) {
 					return underlayLookupResult{}, tc.lookupErr
 				},
 			}
@@ -117,6 +109,42 @@ func TestMobileUnderlayDNSStatusAndNonAddressTypes(t *testing.T) {
 			}
 			if resp.Rcode != tc.wantRcode || len(resp.Answer) != 0 {
 				t.Fatalf("got rcode=%d answers=%d, want rcode=%d answers=0", resp.Rcode, len(resp.Answer), tc.wantRcode)
+			}
+		})
+	}
+}
+
+func TestMobileUnderlayDNSReturnsScopedRecords(t *testing.T) {
+	for _, value := range []string{
+		"_service._tcp.example. 42 IN SRV 10 5 443 server.example.",
+		"example. 0 IN TXT \"verification=example\"",
+		"5.2.0.192.in-addr.arpa. 123 IN PTR server.example.",
+		"example. 30 IN HTTPS 1 . alpn=h2",
+	} {
+		record, err := mDNS.NewRR(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		header := record.Header()
+		t.Run(mDNS.TypeToString[header.Rrtype], func(t *testing.T) {
+			req := new(mDNS.Msg).SetQuestion(header.Name, header.Rrtype)
+			transport := &mobileUnderlayDNSTransport{
+				interfaceIndex: func() int { return 7 },
+				lookup: func(_ context.Context, index int, question mDNS.Question, _ time.Duration) (underlayLookupResult, error) {
+					if index != 7 || question != req.Question[0] {
+						t.Fatalf("unexpected lookup: index=%d, question=%v", index, question)
+					}
+					return underlayLookupResult{records: []mDNS.RR{record}}, nil
+				},
+			}
+			resp, err := transport.Exchange(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.Id != req.Id || !resp.Response || resp.Rcode != mDNS.RcodeSuccess ||
+				len(resp.Question) != 1 || resp.Question[0] != req.Question[0] ||
+				len(resp.Answer) != 1 || resp.Answer[0].String() != record.String() {
+				t.Fatalf("unexpected response: %v", resp)
 			}
 		})
 	}
@@ -151,8 +179,11 @@ func TestMobileUnderlayDNSDarwinRejectsZeroInterface(t *testing.T) {
 
 	// Verify interfaceIndex=0 is rejected directly at the Darwin helper so it
 	// can never fall back to kDNSServiceInterfaceIndexAny and loop into TUN DNS.
-	if _, err := darwinScopedDNSServiceLookup(ctx, 0, "localhost.", mDNS.TypeA, 2*time.Second); !errors.Is(err, errMobileUnderlayDNSUnavailable) {
-		t.Fatalf("expected interfaceIndex=0 rejection, got %v", err)
+	for _, rrType := range []uint16{mDNS.TypeA, mDNS.TypeHTTPS} {
+		question := mDNS.Question{Name: "localhost.", Qtype: rrType, Qclass: mDNS.ClassINET}
+		if _, err := darwinScopedDNSServiceLookup(ctx, 0, question, 2*time.Second); !errors.Is(err, errMobileUnderlayDNSUnavailable) {
+			t.Fatalf("expected interfaceIndex=0 rejection for %v, got %v", question, err)
+		}
 	}
 }
 

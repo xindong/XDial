@@ -19,8 +19,24 @@ typedef struct {
 	uint32_t ttl;
 	int32_t error_code;
 	int answer_count;
+	uint16_t query_type;
+	int has_terminal_record;
 	int done;
 } xdial_underlay_dns_result;
+
+static int xdial_underlay_dns_accept_callback(xdial_underlay_dns_result *result, DNSServiceErrorType error_code) {
+	if (result->done) {
+		return 0;
+	}
+	if (error_code != kDNSServiceErr_NoError) {
+		if (error_code != kDNSServiceErr_NoSuchRecord || result->answer_count == 0) {
+			result->error_code = error_code;
+		}
+		result->done = 1;
+		return 0;
+	}
+	return 1;
+}
 
 static int64_t xdial_underlay_dns_now_millis(void) {
 	struct timespec now;
@@ -42,11 +58,7 @@ static void xdial_underlay_dns_reply(
 	(void)interface_index;
 	(void)hostname;
 	xdial_underlay_dns_result *result = (xdial_underlay_dns_result *)context;
-	if (error_code != kDNSServiceErr_NoError) {
-		if (error_code != kDNSServiceErr_NoSuchRecord || result->answer_count == 0) {
-			result->error_code = error_code;
-		}
-		result->done = 1;
+	if (!xdial_underlay_dns_accept_callback(result, error_code)) {
 		return;
 	}
 	if ((flags & kDNSServiceFlagsAdd) != 0 && address != NULL) {
@@ -79,13 +91,67 @@ static void xdial_underlay_dns_reply(
 	}
 }
 
+static void xdial_underlay_dns_record_reply(
+	DNSServiceRef sd_ref,
+	DNSServiceFlags flags,
+	uint32_t interface_index,
+	DNSServiceErrorType error_code,
+	const char *name,
+	uint16_t rr_type,
+	uint16_t rr_class,
+	uint16_t data_length,
+	const void *data,
+	uint32_t ttl,
+	void *context
+) {
+	(void)sd_ref;
+	(void)interface_index;
+	xdial_underlay_dns_result *result = context;
+	if (!xdial_underlay_dns_accept_callback(result, error_code)) {
+		return;
+	}
+	if ((flags & kDNSServiceFlagsAdd) != 0) {
+		size_t name_length = strlen(name);
+		// Frame each result with network-order lengths and RR metadata.
+		uint16_t fields[] = {htons((uint16_t)name_length), htons(rr_type), htons(rr_class), htons(data_length)};
+		uint32_t wire_ttl = htonl(ttl);
+		size_t frame_length = sizeof(fields) + sizeof(wire_ttl) + name_length + data_length;
+		if (frame_length > result->output_size - result->output_length) {
+			result->error_code = kDNSServiceErr_NoMemory;
+			result->done = 1;
+			return;
+		}
+		char *frame = result->output + result->output_length;
+		memcpy(frame, fields, sizeof(fields));
+		memcpy(frame + sizeof(fields), &wire_ttl, sizeof(wire_ttl));
+		frame += sizeof(fields) + sizeof(wire_ttl);
+		memcpy(frame, name, name_length);
+		if (data_length != 0) {
+			memcpy(frame + name_length, data, data_length);
+		}
+		result->output_length += frame_length;
+		result->answer_count++;
+		if (rr_type != kDNSServiceType_CNAME || result->query_type == kDNSServiceType_CNAME ||
+			result->query_type == kDNSServiceType_ANY) {
+			result->has_terminal_record = 1;
+		}
+	}
+	// A CNAME can arrive in a separate batch before the requested record.
+	if (result->has_terminal_record && (flags & kDNSServiceFlagsMoreComing) == 0) {
+		result->done = 1;
+	}
+}
+
 static int32_t xdial_underlay_dns_lookup(
 	uint32_t interface_index,
 	const char *hostname,
 	uint32_t protocol,
+	uint16_t rr_type,
+	uint16_t rr_class,
 	int timeout_millis,
 	char *output,
 	size_t output_size,
+	size_t *output_length,
 	uint32_t *ttl
 ) {
 	if (interface_index == 0) {
@@ -95,20 +161,20 @@ static int32_t xdial_underlay_dns_lookup(
 	memset(&result, 0, sizeof(result));
 	result.output = output;
 	result.output_size = output_size;
+	result.query_type = rr_type;
 	if (output_size > 0) {
 		output[0] = '\0';
 	}
 
 	DNSServiceRef service = NULL;
-	DNSServiceErrorType start_error = DNSServiceGetAddrInfo(
-		&service,
-		kDNSServiceFlagsTimeout,
-		interface_index,
-		protocol,
-		hostname,
-		xdial_underlay_dns_reply,
-		&result
-	);
+	DNSServiceErrorType start_error;
+	if (protocol != 0) {
+		start_error = DNSServiceGetAddrInfo(&service, kDNSServiceFlagsTimeout, interface_index,
+			protocol, hostname, xdial_underlay_dns_reply, &result);
+	} else {
+		start_error = DNSServiceQueryRecord(&service, kDNSServiceFlagsTimeout | kDNSServiceFlagsReturnIntermediates, interface_index,
+			hostname, rr_type, rr_class, xdial_underlay_dns_record_reply, &result);
+	}
 	if (start_error != kDNSServiceErr_NoError) {
 		return start_error;
 	}
@@ -152,6 +218,7 @@ static int32_t xdial_underlay_dns_lookup(
 		}
 	}
 	DNSServiceRefDeallocate(service);
+	*output_length = result.output_length;
 	if (ttl != NULL) {
 		*ttl = result.ttl;
 	}
@@ -162,6 +229,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/binary"
 	"net/netip"
 	"strings"
 	"time"
@@ -180,8 +248,7 @@ func mobileUnderlayUsesNativeScopedResolver() bool {
 func darwinScopedDNSServiceLookup(
 	ctx context.Context,
 	interfaceIndex int,
-	name string,
-	qtype uint16,
+	question mDNS.Question,
 	timeout time.Duration,
 ) (underlayLookupResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -190,21 +257,30 @@ func darwinScopedDNSServiceLookup(
 	if interfaceIndex <= 0 {
 		return underlayLookupResult{}, errMobileUnderlayDNSUnavailable
 	}
-	protocol := C.uint32_t(C.kDNSServiceProtocol_IPv4)
-	if qtype == mDNS.TypeAAAA {
-		protocol = C.uint32_t(C.kDNSServiceProtocol_IPv6)
+	var protocol C.uint32_t
+	if question.Qclass == mDNS.ClassINET {
+		switch question.Qtype {
+		case mDNS.TypeA:
+			protocol = C.kDNSServiceProtocol_IPv4
+		case mDNS.TypeAAAA:
+			protocol = C.kDNSServiceProtocol_IPv6
+		}
 	}
-	cName := C.CString(name)
+	cName := C.CString(question.Name)
 	defer C.free(unsafe.Pointer(cName))
 	buffer := make([]byte, mobileUnderlayDNSBufBytes)
 	var ttl C.uint32_t
+	var outputLength C.size_t
 	code := int32(C.xdial_underlay_dns_lookup(
 		C.uint32_t(interfaceIndex),
 		cName,
 		protocol,
+		C.uint16_t(question.Qtype),
+		C.uint16_t(question.Qclass),
 		C.int(timeout.Milliseconds()),
 		(*C.char)(unsafe.Pointer(&buffer[0])),
 		C.size_t(len(buffer)),
+		&outputLength,
 		&ttl,
 	))
 	if err := ctx.Err(); err != nil {
@@ -221,16 +297,51 @@ func darwinScopedDNSServiceLookup(
 	default:
 		return underlayLookupResult{}, E.New("underlay scoped DNS lookup failed: code ", code)
 	}
+	if outputLength == 0 {
+		return underlayLookupResult{}, errMobileUnderlayDNSNoData
+	}
+	buffer = buffer[:int(outputLength)]
+	if protocol == 0 {
+		records, err := unpackUnderlayDNSRecords(buffer)
+		return underlayLookupResult{records: records}, err
+	}
 	addresses := make([]netip.Addr, 0, 4)
-	for _, value := range strings.Fields(C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))) {
+	for _, value := range strings.Fields(string(buffer)) {
 		address, err := netip.ParseAddr(value)
 		if err != nil {
 			return underlayLookupResult{}, E.Cause(err, "parse underlay DNS answer")
 		}
 		addresses = append(addresses, address.Unmap())
 	}
-	if len(addresses) == 0 {
-		return underlayLookupResult{}, errMobileUnderlayDNSNoData
-	}
 	return underlayLookupResult{addresses: addresses, ttl: uint32(ttl)}, nil
+}
+
+func unpackUnderlayDNSRecords(buffer []byte) ([]mDNS.RR, error) {
+	const headerSize = 12
+	var records []mDNS.RR
+	for len(buffer) != 0 {
+		if len(buffer) < headerSize {
+			return nil, E.New("truncated underlay DNS record header")
+		}
+		nameLength := int(binary.BigEndian.Uint16(buffer[:2]))
+		header := mDNS.RR_Header{
+			Rrtype:   binary.BigEndian.Uint16(buffer[2:4]),
+			Class:    binary.BigEndian.Uint16(buffer[4:6]),
+			Rdlength: binary.BigEndian.Uint16(buffer[6:8]),
+			Ttl:      binary.BigEndian.Uint32(buffer[8:12]),
+		}
+		buffer = buffer[headerSize:]
+		recordLength := nameLength + int(header.Rdlength)
+		if nameLength == 0 || len(buffer) < recordLength {
+			return nil, E.New("invalid underlay DNS record length")
+		}
+		header.Name = string(buffer[:nameLength])
+		record, _, err := mDNS.UnpackRRWithHeader(header, buffer[nameLength:recordLength], 0)
+		if err != nil {
+			return nil, E.Cause(err, "decode underlay DNS record")
+		}
+		records = append(records, record)
+		buffer = buffer[recordLength:]
+	}
+	return records, nil
 }

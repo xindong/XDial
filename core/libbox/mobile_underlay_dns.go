@@ -38,11 +38,12 @@ type mobileUnderlayDNSServerOptions struct {
 type underlayLookupResult struct {
 	addresses []netip.Addr
 	ttl       uint32
+	records   []mDNS.RR
 }
 
 // mobileUnderlayDNSTransport resolves Direct-bound names through the live
 // physical Underlay interface on Apple Network Extensions using interface-scoped
-// DNSServiceGetAddrInfo, avoiding loops back into the tunnel's 198.18.0.2 DNS
+// DNS-SD lookups, avoiding loops back into the tunnel's 198.18.0.2 DNS
 // and following Wi-Fi / cellular changes published by NWPathMonitor.
 //
 // On non-Darwin platforms (e.g. Linux tests), it delegates to the configured
@@ -54,7 +55,7 @@ type mobileUnderlayDNSTransport struct {
 	transportManager adapter.DNSTransportManager
 	fallbackTag      string
 	fallback         adapter.DNSTransport
-	lookup           func(ctx context.Context, interfaceIndex int, name string, qtype uint16, timeout time.Duration) (underlayLookupResult, error)
+	lookup           func(ctx context.Context, interfaceIndex int, question mDNS.Question, timeout time.Duration) (underlayLookupResult, error)
 	interfaceIndex   func() int
 }
 
@@ -150,9 +151,6 @@ func (t *mobileUnderlayDNSTransport) ExchangeAsync(
 
 func (t *mobileUnderlayDNSTransport) exchangeScoped(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	question := message.Question[0]
-	if question.Qtype != mDNS.TypeA && question.Qtype != mDNS.TypeAAAA {
-		return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
-	}
 	ifaceIndex := t.currentInterfaceIndex()
 	if ifaceIndex <= 0 {
 		// Never fall back to kDNSServiceInterfaceIndexAny (0), which would route
@@ -179,7 +177,7 @@ func (t *mobileUnderlayDNSTransport) exchangeScoped(ctx context.Context, message
 	if lookup == nil {
 		lookup = darwinScopedDNSServiceLookup
 	}
-	result, err := lookup(ctx, ifaceIndex, question.Name, question.Qtype, timeout)
+	result, err := lookup(ctx, ifaceIndex, question, timeout)
 	if err != nil {
 		var rcodeErr dns.RcodeError
 		if errors.As(err, &rcodeErr) {
@@ -189,6 +187,12 @@ func (t *mobileUnderlayDNSTransport) exchangeScoped(ctx context.Context, message
 			return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
 		}
 		return nil, err
+	}
+	if len(result.records) > 0 {
+		response := new(mDNS.Msg).SetReply(message)
+		response.RecursionAvailable = true
+		response.Answer = result.records
+		return response, nil
 	}
 	ttl := result.ttl
 	if ttl == 0 {
