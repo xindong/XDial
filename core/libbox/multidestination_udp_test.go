@@ -618,3 +618,97 @@ func TestTransparentSOCKSUDPDirectDualStackAndIPv6Mapping(t *testing.T) {
 		t.Fatalf("IPv6 source port changed after IPv4 traffic: got %s, want %s", fromV6A2, fromV6A)
 	}
 }
+
+// Verify that when a domain target and a literal-IP target on the same
+// association resolve to the exact same IP:port, each logical target preserves
+// its own reply source mapping without stealing the other's replies.
+func TestTransparentSOCKSUDPDirectDomainAndLiteralSameResolvedPeer(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverAddr := M.SocksaddrFromNet(server.LocalAddr())
+	go func() {
+		var data [2048]byte
+		for {
+			n, from, readErr := server.ReadFromUDP(data[:])
+			if readErr != nil {
+				return
+			}
+			_, _ = server.WriteToUDP(data[:n], from)
+		}
+	}()
+
+	port := freeFlowCorrectionPort(t)
+	rt := newLoopbackFlowRuntimeWithConfig(t, fmt.Sprintf(`{
+		"log":{"disabled":true},
+		"dns":{
+			"servers":[{"type":"hosts","tag":"local-hosts","predefined":{"alias.example":["127.0.0.1"]}}],
+			"final":"local-hosts"
+		},
+		"inbounds":[{"type":"socks","tag":"flow","listen":"127.0.0.1","listen_port":%d,"xdial_flow_metadata":true}],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{
+			"rules":[{"action":"resolve","server":"local-hosts"}],
+			"final":"direct"
+		}
+	}`, port))
+	defer rt.Stop()
+
+	client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), socks.Version5, "", "")
+	domainDest := M.ParseSocksaddrHostPort("alias.example", serverAddr.Port)
+
+	for _, domainFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("domain-first=%t", domainFirst), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			deadline, _ := ctx.Deadline()
+
+			firstDest := serverAddr
+			secondDest := domainDest
+			if domainFirst {
+				firstDest = domainDest
+				secondDest = serverAddr
+			}
+
+			conn, err := client.ListenPacket(ctx, firstDest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			packetConn, ok := conn.(N.PacketConn)
+			if !ok {
+				t.Fatalf("socks ListenPacket returned %T, want N.PacketConn", conn)
+			}
+
+			sendAndVerify := func(dest M.Socksaddr, payload string) {
+				t.Helper()
+				pkt := buf.NewPacket()
+				pkt.Resize(N.CalculateFrontHeadroom(packetConn), 0)
+				_, _ = pkt.WriteString(payload)
+				if err := packetConn.WritePacket(pkt, dest); err != nil {
+					t.Fatalf("send %q to %s: %v", payload, dest, err)
+				}
+				reply := buf.NewPacket()
+				defer reply.Release()
+				from, err := packetConn.ReadPacket(reply)
+				if err != nil {
+					t.Fatalf("read reply for %s: %v", dest, err)
+				}
+				if from != dest || string(reply.Bytes()) != payload {
+					t.Fatalf("reply for %s: got %q from %s, want %q from %s", dest, string(reply.Bytes()), from, payload, dest)
+				}
+			}
+
+			// Interleave writes to both logical targets sharing the same resolved IP:port.
+			sendAndVerify(firstDest, "first-1")
+			sendAndVerify(secondDest, "second-1")
+			sendAndVerify(firstDest, "first-2")
+			sendAndVerify(secondDest, "second-2")
+		})
+	}
+}

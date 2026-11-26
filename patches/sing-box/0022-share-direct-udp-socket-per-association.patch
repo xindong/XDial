@@ -139,12 +139,13 @@
  				destination: peer.Destination, queue: make(chan []byte, xdialUDPQueueSize),
 --- /dev/null
 +++ b/protocol/socks/xdial_udp_pool.go
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,408 @@
 +package socks
 +
 +import (
 +	"bytes"
 +	"context"
++	"errors"
 +	"net"
 +	"net/netip"
 +	"os"
@@ -159,6 +160,8 @@
 +)
 +
 +const xdialUDPDirectQueueSize = 64
++
++var errXDialDirectPeerConflict = errors.New("xdial direct udp peer already owned by an active target")
 +
 +// xdialDirectPacketPool owns the shared unconnected Direct UDP sockets for one
 +// transparent-proxy SOCKS5 UDP association.
@@ -201,22 +204,31 @@
 +	if p.closed || p.ctx.Err() != nil {
 +		return nil, net.ErrClosed
 +	}
-+	if socket := p.sockets[key]; socket != nil {
-+		if handle, err := socket.newHandle(initialPeer); err == nil {
-+			return handle, nil
-+		}
-+		delete(p.sockets, key)
-+	}
 +	openCtx := p.ctx
 +	if metadata := adapter.ContextFrom(reqCtx); metadata != nil {
 +		openCtx = adapter.WithContext(openCtx, metadata)
++	}
++	if socket := p.sockets[key]; socket != nil {
++		handle, err := socket.newHandle(reqCtx, initialPeer)
++		if err == nil {
++			return handle, nil
++		}
++		if errors.Is(err, errXDialDirectPeerConflict) {
++			// Two live logical targets (e.g. a domain target and a literal-IP
++			// target) resolved to the same concrete IP:port. Sharing one local
++			// UDP port would make their replies indistinguishable on the wire,
++			// so isolate the colliding target on a dedicated socket while
++			// keeping the shared socket intact for all other destinations.
++			return open(openCtx)
++		}
++		delete(p.sockets, key)
 +	}
 +	raw, err := open(openCtx)
 +	if err != nil {
 +		return nil, err
 +	}
 +	socket := newXDialSharedDirectSocket(raw, p.fallback)
-+	handle, err := socket.newHandle(initialPeer)
++	handle, err := socket.newHandle(reqCtx, initialPeer)
 +	if err != nil {
 +		_ = raw.Close()
 +		return nil, err
@@ -280,7 +292,7 @@
 +	}
 +}
 +
-+func (s *xdialSharedDirectSocket) newHandle(initialPeer M.Socksaddr) (*xdialSharedDirectHandle, error) {
++func (s *xdialSharedDirectSocket) newHandle(reqCtx context.Context, initialPeer M.Socksaddr) (*xdialSharedDirectHandle, error) {
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
 +	if s.closed {
@@ -289,26 +301,30 @@
 +		}
 +		return nil, net.ErrClosed
 +	}
++	peer, hasPeer := xdialDirectPeerKey(initialPeer)
++	if hasPeer {
++		if existing := s.routes[peer]; existing != nil {
++			if existing.reqCtx == nil || existing.reqCtx.Err() == nil {
++				return nil, errXDialDirectPeerConflict
++			}
++			delete(existing.peers, peer)
++			delete(s.routes, peer)
++		}
++	}
 +	handle := &xdialSharedDirectHandle{
 +		socket:   s,
++		reqCtx:   reqCtx,
 +		queue:    make(chan xdialSharedDatagram, xdialUDPDirectQueueSize),
 +		done:     make(chan struct{}),
 +		deadline: pipe.MakeDeadline(),
 +		peers:    make(map[netip.AddrPort]struct{}, 1),
 +	}
 +	s.handles[handle] = struct{}{}
-+	if peer, ok := xdialDirectPeerKey(initialPeer); ok {
-+		s.registerPeerLocked(handle, peer)
++	if hasPeer {
++		s.routes[peer] = handle
++		handle.peers[peer] = struct{}{}
 +	}
 +	return handle, nil
-+}
-+
-+func (s *xdialSharedDirectSocket) registerPeerLocked(handle *xdialSharedDirectHandle, peer netip.AddrPort) {
-+	if previous := s.routes[peer]; previous != nil && previous != handle {
-+		delete(previous.peers, peer)
-+	}
-+	s.routes[peer] = handle
-+	handle.peers[peer] = struct{}{}
 +}
 +
 +func (s *xdialSharedDirectSocket) ensurePeer(handle *xdialSharedDirectHandle, peer netip.AddrPort) bool {
@@ -327,8 +343,13 @@
 +	if _, active := s.handles[handle]; !active {
 +		return false
 +	}
-+	if s.routes[peer] != handle {
-+		s.registerPeerLocked(handle, peer)
++	if existing := s.routes[peer]; existing == nil {
++		s.routes[peer] = handle
++		handle.peers[peer] = struct{}{}
++	} else if existing != handle && existing.reqCtx != nil && existing.reqCtx.Err() != nil {
++		delete(existing.peers, peer)
++		s.routes[peer] = handle
++		handle.peers[peer] = struct{}{}
 +	}
 +	return true
 +}
@@ -415,6 +436,7 @@
 +
 +type xdialSharedDirectHandle struct {
 +	socket   *xdialSharedDirectSocket
++	reqCtx   context.Context
 +	queue    chan xdialSharedDatagram
 +	done     chan struct{}
 +	deadline pipe.Deadline
@@ -528,7 +550,7 @@
 +}
 --- /dev/null
 +++ b/protocol/socks/xdial_udp_pool_test.go
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,306 @@
 +package socks
 +
 +import (
@@ -746,4 +768,92 @@
 +	require.NoError(t, hB.Close())
 +	require.NoError(t, hBound.Close())
 +	require.NoError(t, hV6.Close())
++}
++
++func TestXDialDirectPacketPoolSeparatesCollidingLiveTargetsAndReusesAfterCancel(t *testing.T) {
++	assocCtx, assocCancel := context.WithCancel(context.Background())
++	defer assocCancel()
++
++	pool := newXDialDirectPacketPool(assocCtx, nil)
++	defer pool.Close()
++
++	peer1, err := net.ListenPacket("udp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer peer1.Close()
++	peer2, err := net.ListenPacket("udp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer peer2.Close()
++
++	deadline := time.Now().Add(5 * time.Second)
++	require.NoError(t, peer1.SetDeadline(deadline))
++	require.NoError(t, peer2.SetDeadline(deadline))
++
++	var opens atomic.Int32
++	openSocket := func(context.Context) (net.PacketConn, error) {
++		opens.Add(1)
++		return net.ListenPacket("udp4", "127.0.0.1:0")
++	}
++
++	key := adapter.XDialDirectPacketSocketKey{Outbound: "direct"}
++	peer1Addr := M.SocksaddrFromNet(peer1.LocalAddr())
++	peer2Addr := M.SocksaddrFromNet(peer2.LocalAddr())
++
++	ctx1, cancel1 := context.WithCancel(assocCtx)
++	defer cancel1()
++	ctx2, cancel2 := context.WithCancel(assocCtx)
++	defer cancel2()
++
++	h1, err := pool.Acquire(ctx1, key, peer1Addr, openSocket)
++	require.NoError(t, err)
++	defer h1.Close()
++
++	// A second live target resolving to the same concrete IP:port gets a
++	// dedicated socket instead of stealing h1's reply mapping.
++	h2, err := pool.Acquire(ctx2, key, peer1Addr, openSocket)
++	require.NoError(t, err)
++	defer h2.Close()
++	require.Equal(t, int32(2), opens.Load())
++	require.NotEqual(t, h1.LocalAddr().String(), h2.LocalAddr().String())
++
++	// Non-colliding destinations still share the pool's primary socket with h1.
++	h3, err := pool.Acquire(assocCtx, key, peer2Addr, openSocket)
++	require.NoError(t, err)
++	defer h3.Close()
++	require.Equal(t, int32(2), opens.Load())
++	require.Equal(t, h1.LocalAddr().String(), h3.LocalAddr().String())
++
++	// Both live handles exchange replies with peer1 without cross-talk.
++	require.NoError(t, h1.SetReadDeadline(deadline))
++	require.NoError(t, h2.SetReadDeadline(deadline))
++	_, err = h1.WriteTo([]byte("from-h1"), peer1.LocalAddr())
++	require.NoError(t, err)
++	_, err = h2.WriteTo([]byte("from-h2"), peer1.LocalAddr())
++	require.NoError(t, err)
++
++	buf := make([]byte, 64)
++	for range 2 {
++		n, from, readErr := peer1.ReadFrom(buf)
++		require.NoError(t, readErr)
++		_, err = peer1.WriteTo(append([]byte("echo:"), buf[:n]...), from)
++		require.NoError(t, err)
++	}
++
++	n1, from1, err := h1.ReadFrom(buf)
++	require.NoError(t, err)
++	require.Equal(t, "echo:from-h1", string(buf[:n1]))
++	require.Equal(t, peer1.LocalAddr().String(), from1.String())
++
++	n2, from2, err := h2.ReadFrom(buf)
++	require.NoError(t, err)
++	require.Equal(t, "echo:from-h2", string(buf[:n2]))
++	require.Equal(t, peer1.LocalAddr().String(), from2.String())
++
++	// Once h1's target context is cancelled (e.g. LRU eviction before Close
++	// completes), a new target for peer1 reclaims the shared socket.
++	cancel1()
++	h4, err := pool.Acquire(assocCtx, key, peer1Addr, openSocket)
++	require.NoError(t, err)
++	defer h4.Close()
++	require.Equal(t, int32(2), opens.Load())
++	require.Equal(t, h1.LocalAddr().String(), h4.LocalAddr().String())
 +}
