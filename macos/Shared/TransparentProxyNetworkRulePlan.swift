@@ -97,6 +97,20 @@ enum TransparentProxyNetworkRulePlan {
         return combined
     }
 
+    /// Computes the safe direct-exclusion set for the pre-commit phase of a
+    /// Scenario Switch: only exclusions already active in `source` AND still
+    /// present in `candidate` may remain excluded before `commitPreparedSwitch`.
+    /// Tightening (removing exclusions) happens before handoff so no traffic can
+    /// leak past a stricter target Scenario; widening (adding new exclusions) is
+    /// deferred until after the candidate generation irreversibly commits.
+    static func preCommitDirectExcludedNetworks(
+        source: [TransparentProxyRemoteNetwork],
+        candidate: [TransparentProxyRemoteNetwork]
+    ) -> [TransparentProxyRemoteNetwork] {
+        let sourceSet = Set(source)
+        return candidate.filter { sourceSet.contains($0) }
+    }
+
     private static func isValidPrivateLANNetwork(
         _ network: TransparentProxyRemoteNetwork
     ) -> Bool {

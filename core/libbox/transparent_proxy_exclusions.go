@@ -9,7 +9,6 @@ import (
 
 	"github.com/kafeifei/xdial/core/config"
 	"github.com/sagernet/sing-box/common/srs"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -84,8 +83,7 @@ func collectTransparentProxyRuleSetIPInfo(
 		}
 		if rule.RuntimeMatchKind == config.RuleSetMatchDomain {
 			info[rule.ID] = config.TransparentProxyRuleSetIPInfo{
-				HasDomain: true,
-				ExactIPs:  true,
+				BlocksAll: true,
 			}
 			continue
 		}
@@ -161,105 +159,5 @@ func extractRuleSetIPInfo(content []byte, format string) config.TransparentProxy
 	if err != nil {
 		return config.TransparentProxyRuleSetIPInfo{Opaque: true}
 	}
-	if len(plain.Rules) == 0 {
-		return config.TransparentProxyRuleSetIPInfo{Opaque: true}
-	}
-	result := config.TransparentProxyRuleSetIPInfo{ExactIPs: true}
-	if !collectHeadlessRuleIPInfo(plain.Rules, &result) {
-		return config.TransparentProxyRuleSetIPInfo{Opaque: true}
-	}
-	return result
-}
-
-func collectHeadlessRuleIPInfo(
-	rules []option.HeadlessRule,
-	out *config.TransparentProxyRuleSetIPInfo,
-) bool {
-	for _, rule := range rules {
-		switch rule.Type {
-		case "", C.RuleTypeDefault:
-			opts := rule.DefaultOptions
-			if opts.Invert || hasNonDestinationRuleConditions(opts) {
-				return false
-			}
-			hasDomain := len(opts.Domain) > 0 ||
-				len(opts.DomainSuffix) > 0 ||
-				len(opts.DomainKeyword) > 0 ||
-				len(opts.DomainRegex) > 0 ||
-				len(opts.AdGuardDomain) > 0 ||
-				opts.DomainMatcher != nil ||
-				opts.AdGuardDomainMatcher != nil
-			hasIP := len(opts.IPCIDR) > 0 || opts.IPSet != nil
-			if !hasDomain && !hasIP {
-				return false
-			}
-			out.HasDomain = out.HasDomain || hasDomain
-			for _, raw := range opts.IPCIDR {
-				prefix, ok := parseRuleSetPrefix(raw)
-				if !ok {
-					return false
-				}
-				if overlapsPrivateLAN(prefix) {
-					out.CIDRs = append(out.CIDRs, prefix)
-				}
-			}
-			if opts.IPSet != nil {
-				for _, prefix := range opts.IPSet.Prefixes() {
-					if overlapsPrivateLAN(prefix) {
-						out.CIDRs = append(out.CIDRs, prefix)
-					}
-				}
-			}
-		case C.RuleTypeLogical:
-			if rule.LogicalOptions.Invert || len(rule.LogicalOptions.Rules) == 0 {
-				return false
-			}
-			if !collectHeadlessRuleIPInfo(rule.LogicalOptions.Rules, out) {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func parseRuleSetPrefix(raw string) (netip.Prefix, bool) {
-	raw = strings.TrimSpace(raw)
-	if prefix, err := netip.ParsePrefix(raw); err == nil {
-		addr := prefix.Addr()
-		bits := prefix.Bits()
-		if addr.Is4In6() {
-			addr = addr.Unmap()
-			bits -= 96
-			if bits < 0 || bits > 32 {
-				return netip.Prefix{}, false
-			}
-		}
-		return netip.PrefixFrom(addr, bits).Masked(), true
-	}
-	if addr, err := netip.ParseAddr(raw); err == nil {
-		addr = addr.Unmap()
-		return netip.PrefixFrom(addr, addr.BitLen()), true
-	}
-	return netip.Prefix{}, false
-}
-
-var libboxPrivateLANPrefixes = []netip.Prefix{
-	netip.MustParsePrefix("10.0.0.0/8"),
-	netip.MustParsePrefix("172.16.0.0/12"),
-	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("fc00::/7"),
-}
-
-func overlapsPrivateLAN(prefix netip.Prefix) bool {
-	if !prefix.IsValid() {
-		return false
-	}
-	for _, candidate := range libboxPrivateLANPrefixes {
-		if candidate.Overlaps(prefix) {
-			return true
-		}
-	}
-	return false
+	return config.SummarizeHeadlessRulesForExclusions(plain.Rules)
 }

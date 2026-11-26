@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -25,13 +26,19 @@ type TransparentProxyRemoteNetwork struct {
 }
 
 // TransparentProxyRuleSetIPInfo carries pre-parsed destination matching facts
-// for a materialized URL or subscription GEOIP rule set. Leaving ExactIPs false
-// (or Opaque true) makes the exclusion planner treat the rule set conservatively.
+// for a materialized URL or subscription GEOIP rule set.
+//
+// DirectCIDRs contains only private/LAN prefixes that the rule set matches
+// unconditionally (independent of domain or non-destination predicates).
+// BlockCIDRs contains a sound upper bound on private/LAN prefixes the rule set
+// might match when BlocksAll is false. BlocksAll indicates the rule set may
+// match arbitrary private/LAN IPs (for example via a domain rule). Leaving
+// Opaque true makes the planner treat the rule set conservatively.
 type TransparentProxyRuleSetIPInfo struct {
-	HasDomain bool
-	ExactIPs  bool
-	CIDRs     []netip.Prefix
-	Opaque    bool
+	DirectCIDRs []netip.Prefix
+	BlockCIDRs  []netip.Prefix
+	BlocksAll   bool
+	Opaque      bool
 }
 
 var privateLANUniverse = []netip.Prefix{
@@ -57,10 +64,38 @@ func IsPrivateLANPrefix(prefix netip.Prefix) bool {
 	return false
 }
 
+// SummarizeHeadlessRulesForExclusions lowers a sing-box PlainRuleSet's top-level
+// headless rules (which are logically OR'd by sing-box) into exact Direct and
+// non-Direct private/LAN bounds. Both Native rules and materialized URL /
+// subscription GEOIP rule sets share this single classifier.
+func SummarizeHeadlessRulesForExclusions(rules []option.HeadlessRule) TransparentProxyRuleSetIPInfo {
+	if len(rules) == 0 {
+		return TransparentProxyRuleSetIPInfo{Opaque: true}
+	}
+	var combined TransparentProxyRuleSetIPInfo
+	for _, rule := range rules {
+		part := classifyHeadlessRuleForExclusions(rule, false)
+		if part.Opaque {
+			return TransparentProxyRuleSetIPInfo{Opaque: true}
+		}
+		combined.BlocksAll = combined.BlocksAll || part.BlocksAll
+		combined.DirectCIDRs = append(combined.DirectCIDRs, part.DirectCIDRs...)
+		combined.BlockCIDRs = append(combined.BlockCIDRs, part.BlockCIDRs...)
+	}
+	combined.DirectCIDRs = coalescePrefixes(combined.DirectCIDRs)
+	if combined.BlocksAll {
+		combined.BlockCIDRs = nil
+	} else {
+		combined.BlockCIDRs = coalescePrefixes(combined.BlockCIDRs)
+	}
+	return combined
+}
+
 // ComputeTransparentProxyDirectExcludedNetworks computes the canonical, bounded
 // set of private/LAN prefixes that the active Scenario routes strictly to Direct
 // and that can therefore bypass macOS NETransparentProxyProvider without altering
-// routing, application attribution, Tailscale MagicDNS, or system DNS capture.
+// routing, domain precedence, application attribution, Tailscale MagicDNS, or
+// system DNS capture.
 func ComputeTransparentProxyDirectExcludedNetworks(
 	profile *Profile,
 	systemDNS []string,
@@ -137,9 +172,12 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 		}
 	}
 
+	// Invariant: a private/LAN IP is placed in `excluded` only if every flow to
+	// that IP — regardless of hostname/SNI or source application — is guaranteed
+	// to match a Direct rule (or `route.final = direct`) before any non-Direct
+	// IP, domain, application, Tailscale MagicDNS, or opaque rule.
 	undecided := append([]netip.Prefix(nil), privateLANUniverse...)
 	var excluded []netip.Prefix
-	seenNonDirectDomain := false
 
 	promoteDirect := func(cidrs []netip.Prefix) {
 		if len(undecided) == 0 || len(cidrs) == 0 {
@@ -160,6 +198,23 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 	}
 	blockAllRemaining := func() {
 		undecided = nil
+	}
+	applyRuleSetInfo := func(info TransparentProxyRuleSetIPInfo, isDirect bool) {
+		if info.Opaque {
+			if !isDirect {
+				blockAllRemaining()
+			}
+			return
+		}
+		if isDirect {
+			promoteDirect(info.DirectCIDRs)
+			return
+		}
+		if info.BlocksAll {
+			blockAllRemaining()
+		} else {
+			blockCIDRs(info.BlockCIDRs)
+		}
 	}
 
 	isDirectOutbound := func(outTag string) bool {
@@ -204,13 +259,12 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 			parsedCIDRs, cidrsValid := parseRuleCIDRs(ruleSet.CIDRs)
 			if ruleSet.Invert {
 				if !isDirect {
-					if hasDomains {
-						seenNonDirectDomain = true
-					}
 					if !cidrsValid || !hasCIDRs {
 						blockAllRemaining()
 					} else {
-						// Inverted CIDR matches everything outside parsedCIDRs.
+						// For !(domain || cidr) and !cidr alike, any IP inside
+						// parsedCIDRs never matches; IPs outside parsedCIDRs can
+						// match (including literal IP flows).
 						outside := subtractPrefixSets(privateLANUniverse, parsedCIDRs)
 						blockCIDRs(outside)
 					}
@@ -221,8 +275,13 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 				}
 				continue
 			}
+			// In compileTransparentProxyRuleSet, non-inverted Domains run before
+			// CIDRs as a separate rule. A non-Direct domain rule can match a
+			// hostname resolving into any private/LAN IP, so it blocks all
+			// still-undecided prefixes from bypassing NETransparentProxyProvider.
 			if hasDomains && !isDirect {
-				seenNonDirectDomain = true
+				blockAllRemaining()
+				continue
 			}
 			if hasCIDRs {
 				if !cidrsValid {
@@ -240,26 +299,7 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 
 		case RuleSetTypeNative:
 			classified := classifyNativeRuleForExclusions(ruleSet.NativeRule, ruleSet.Invert)
-			if classified.opaque {
-				if !isDirect {
-					blockAllRemaining()
-				}
-				continue
-			}
-			if classified.hasDomain && !isDirect {
-				seenNonDirectDomain = true
-			}
-			if isDirect {
-				if len(classified.directCIDRs) > 0 {
-					promoteDirect(classified.directCIDRs)
-				}
-			} else {
-				if classified.blocksAll {
-					blockAllRemaining()
-				} else if len(classified.blockCIDRs) > 0 {
-					blockCIDRs(classified.blockCIDRs)
-				}
-			}
+			applyRuleSetInfo(classified, isDirect)
 
 		case RuleSetTypeURL:
 			if ruleSet.URL == "" {
@@ -274,30 +314,12 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 			info, hasInfo := ruleSetInfo[ruleSet.ID]
 			if !hasInfo {
 				if ruleSet.RuntimeMatchKind == RuleSetMatchDomain {
-					info = TransparentProxyRuleSetIPInfo{
-						HasDomain: true,
-						ExactIPs:  true,
-					}
+					info = TransparentProxyRuleSetIPInfo{BlocksAll: true}
 				} else {
 					info = TransparentProxyRuleSetIPInfo{Opaque: true}
 				}
 			}
-			if info.Opaque || !info.ExactIPs {
-				if !isDirect {
-					blockAllRemaining()
-				}
-				continue
-			}
-			if info.HasDomain && !isDirect {
-				seenNonDirectDomain = true
-			}
-			if isDirect {
-				if !info.HasDomain && len(info.CIDRs) > 0 {
-					promoteDirect(info.CIDRs)
-				}
-			} else if len(info.CIDRs) > 0 {
-				blockCIDRs(info.CIDRs)
-			}
+			applyRuleSetInfo(info, isDirect)
 		}
 	}
 
@@ -332,7 +354,7 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 			switch rule.matchKey {
 			case "domain", "domain_suffix", "domain_keyword":
 				if !isDirect {
-					seenNonDirectDomain = true
+					blockAllRemaining()
 				}
 			case "ip_cidr":
 				rawValues, _ := rule.values.([]string)
@@ -357,22 +379,10 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 			case "rule_set":
 				tag, _ := rule.values.(string)
 				info, hasInfo := ruleSetInfo[tag]
-				if !hasInfo || info.Opaque || !info.ExactIPs {
-					if !isDirect {
-						blockAllRemaining()
-					}
-					continue
+				if !hasInfo {
+					info = TransparentProxyRuleSetIPInfo{Opaque: true}
 				}
-				if info.HasDomain && !isDirect {
-					seenNonDirectDomain = true
-				}
-				if isDirect {
-					if !info.HasDomain && len(info.CIDRs) > 0 {
-						promoteDirect(info.CIDRs)
-					}
-				} else if len(info.CIDRs) > 0 {
-					blockCIDRs(info.CIDRs)
-				}
+				applyRuleSetInfo(info, isDirect)
 			default:
 				if !isDirect {
 					blockAllRemaining()
@@ -396,20 +406,10 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 		}
 	}
 
-	normalizedLocalSubnets := normalizePrivateLANSubnets(underlayLocalSubnets)
+	// Any prefix still in `undecided` here has no preceding non-Direct IP,
+	// domain, application, MagicDNS, or opaque rule that can match it.
 	if len(undecided) > 0 && isDirectOutbound(defaultTag) {
-		if !seenNonDirectDomain {
-			// No non-Direct domain rule precedes final: direct, so every remaining
-			// undecided private/LAN range is unconditionally Direct.
-			promoteDirect(undecided)
-		} else if len(normalizedLocalSubnets) > 0 {
-			// A non-Direct domain rule (e.g. corporate intranet domains via VPN)
-			// precedes final: direct. Keep unmentioned RFC1918 ranges captured so
-			// domain-routed corporate IPs stay inside XDial, while still allowing
-			// the current Underlay physical interface's on-link LAN subnet (when
-			// not claimed by any non-Direct IP / App / MagicDNS rule) to bypass.
-			promoteDirect(normalizedLocalSubnets)
-		}
+		promoteDirect(undecided)
 	}
 
 	// 5. Preserve DNS sealing (INV3): never exclude any system DNS server host
@@ -420,10 +420,11 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 		excluded = subtractPrefixSets(excluded, dnsHostPrefixes)
 	}
 
+	normalizedLocalSubnets := normalizePrivateLANSubnets(underlayLocalSubnets)
 	excluded = coalescePrefixes(excluded)
 	if len(excluded) > MaxTransparentProxyDirectExcludedNetworks {
-		// Fall back safely to the local Underlay subnet portion if complex hole
-		// punching exceeded the NE rule budget.
+		// Fall back safely to the local Underlay subnet portion of the already
+		// verified `excluded` set if complex hole punching exceeded the NE budget.
 		if len(normalizedLocalSubnets) > 0 {
 			excluded = coalescePrefixes(intersectPrefixSets(excluded, normalizedLocalSubnets))
 		}
@@ -445,26 +446,36 @@ func ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 	return result, nil
 }
 
-type nativeRuleExclusionClass struct {
-	hasDomain   bool
-	directCIDRs []netip.Prefix
-	blockCIDRs  []netip.Prefix
-	blocksAll   bool
-	opaque      bool
-}
-
-func classifyNativeRuleForExclusions(raw json.RawMessage, outerInvert bool) nativeRuleExclusionClass {
+func classifyNativeRuleForExclusions(raw json.RawMessage, outerInvert bool) TransparentProxyRuleSetIPInfo {
 	var rule option.HeadlessRule
 	if err := json.Unmarshal(raw, &rule); err != nil || !rule.IsValid() {
-		return nativeRuleExclusionClass{opaque: true}
+		return TransparentProxyRuleSetIPInfo{Opaque: true}
 	}
 	return classifyHeadlessRuleForExclusions(rule, outerInvert)
 }
 
-func classifyHeadlessRuleForExclusions(rule option.HeadlessRule, outerInvert bool) nativeRuleExclusionClass {
+func hasNonDestinationHeadlessConditions(options option.DefaultHeadlessRule) bool {
+	remaining := options
+	remaining.Domain = nil
+	remaining.DomainSuffix = nil
+	remaining.DomainKeyword = nil
+	remaining.DomainRegex = nil
+	remaining.IPCIDR = nil
+	remaining.DomainMatcher = nil
+	remaining.IPSet = nil
+	remaining.AdGuardDomain = nil
+	remaining.AdGuardDomainMatcher = nil
+	remaining.Invert = false
+	return !reflect.DeepEqual(remaining, option.DefaultHeadlessRule{})
+}
+
+func classifyHeadlessRuleForExclusions(rule option.HeadlessRule, outerInvert bool) TransparentProxyRuleSetIPInfo {
 	switch rule.Type {
 	case "", C.RuleTypeDefault:
 		opts := rule.DefaultOptions
+		if hasNonDestinationHeadlessConditions(opts) {
+			return TransparentProxyRuleSetIPInfo{Opaque: true}
+		}
 		inverted := outerInvert != opts.Invert
 		hasDomain := len(opts.Domain) > 0 ||
 			len(opts.DomainSuffix) > 0 ||
@@ -475,109 +486,102 @@ func classifyHeadlessRuleForExclusions(rule option.HeadlessRule, outerInvert boo
 			opts.AdGuardDomainMatcher != nil
 		hasIP := len(opts.IPCIDR) > 0 || opts.IPSet != nil
 		if !hasDomain && !hasIP {
-			return nativeRuleExclusionClass{opaque: true}
+			return TransparentProxyRuleSetIPInfo{Opaque: true}
 		}
 		var cidrs []netip.Prefix
 		if len(opts.IPCIDR) > 0 {
 			parsed, ok := parseRuleCIDRs(opts.IPCIDR)
 			if !ok {
-				return nativeRuleExclusionClass{opaque: true}
+				return TransparentProxyRuleSetIPInfo{Opaque: true}
 			}
 			cidrs = append(cidrs, parsed...)
 		}
 		if opts.IPSet != nil {
-			cidrs = append(cidrs, opts.IPSet.Prefixes()...)
+			for _, prefix := range opts.IPSet.Prefixes() {
+				if overlapsPrivateLANUniverse(prefix) {
+					cidrs = append(cidrs, prefix)
+				}
+			}
 		}
 		cidrs = intersectPrefixSets(coalescePrefixes(cidrs), privateLANUniverse)
 
 		if inverted {
 			if hasDomain {
-				return nativeRuleExclusionClass{hasDomain: true, blocksAll: true}
+				// !(domain) and !(domain && ip) both match any IP when domain does not match.
+				return TransparentProxyRuleSetIPInfo{BlocksAll: true}
 			}
 			outside := subtractPrefixSets(privateLANUniverse, cidrs)
-			return nativeRuleExclusionClass{
-				directCIDRs: outside,
-				blockCIDRs:  outside,
+			return TransparentProxyRuleSetIPInfo{
+				DirectCIDRs: outside,
+				BlockCIDRs:  outside,
 			}
 		}
 		if hasDomain && !hasIP {
-			return nativeRuleExclusionClass{hasDomain: true}
+			return TransparentProxyRuleSetIPInfo{BlocksAll: true}
 		}
 		if hasDomain && hasIP {
 			// Default rule ANDs domain and IP: can only match within cidrs when
 			// blocking, and cannot guarantee unconditional direct for literal IPs.
-			return nativeRuleExclusionClass{
-				hasDomain:  true,
-				blockCIDRs: cidrs,
+			return TransparentProxyRuleSetIPInfo{
+				BlockCIDRs: cidrs,
 			}
 		}
-		return nativeRuleExclusionClass{
-			directCIDRs: cidrs,
-			blockCIDRs:  cidrs,
+		return TransparentProxyRuleSetIPInfo{
+			DirectCIDRs: cidrs,
+			BlockCIDRs:  cidrs,
 		}
 
 	case C.RuleTypeLogical:
 		inverted := outerInvert != rule.LogicalOptions.Invert
 		if inverted || len(rule.LogicalOptions.Rules) == 0 {
-			return nativeRuleExclusionClass{opaque: true}
+			return TransparentProxyRuleSetIPInfo{Opaque: true}
 		}
 		switch rule.LogicalOptions.Mode {
 		case C.LogicalTypeOr:
-			var combined nativeRuleExclusionClass
-			for _, child := range rule.LogicalOptions.Rules {
-				c := classifyHeadlessRuleForExclusions(child, false)
-				if c.opaque {
-					return nativeRuleExclusionClass{opaque: true}
-				}
-				combined.hasDomain = combined.hasDomain || c.hasDomain
-				combined.blocksAll = combined.blocksAll || c.blocksAll
-				combined.directCIDRs = append(combined.directCIDRs, c.directCIDRs...)
-				combined.blockCIDRs = append(combined.blockCIDRs, c.blockCIDRs...)
-			}
-			combined.directCIDRs = coalescePrefixes(combined.directCIDRs)
-			combined.blockCIDRs = coalescePrefixes(combined.blockCIDRs)
-			return combined
+			return SummarizeHeadlessRulesForExclusions(rule.LogicalOptions.Rules)
 		case C.LogicalTypeAnd:
-			var combined nativeRuleExclusionClass
-			hasDirectBound := false
+			directCIDRs := append([]netip.Prefix(nil), privateLANUniverse...)
+			blockCIDRs := append([]netip.Prefix(nil), privateLANUniverse...)
 			hasBlockBound := false
 			for _, child := range rule.LogicalOptions.Rules {
 				c := classifyHeadlessRuleForExclusions(child, false)
-				if c.opaque {
-					return nativeRuleExclusionClass{opaque: true}
+				if c.Opaque {
+					return TransparentProxyRuleSetIPInfo{Opaque: true}
 				}
-				combined.hasDomain = combined.hasDomain || c.hasDomain
-				if !c.blocksAll && (len(c.blockCIDRs) > 0 || !c.hasDomain) {
-					if !hasBlockBound {
-						combined.blockCIDRs = append([]netip.Prefix(nil), c.blockCIDRs...)
-						hasBlockBound = true
-					} else {
-						combined.blockCIDRs = intersectPrefixSets(combined.blockCIDRs, c.blockCIDRs)
-					}
-				}
-				if !c.hasDomain && len(c.directCIDRs) > 0 {
-					if !hasDirectBound {
-						combined.directCIDRs = append([]netip.Prefix(nil), c.directCIDRs...)
-						hasDirectBound = true
-					} else {
-						combined.directCIDRs = intersectPrefixSets(combined.directCIDRs, c.directCIDRs)
-					}
-				} else {
-					// If any AND branch depends on domain, it cannot guarantee direct.
-					combined.directCIDRs = nil
-					hasDirectBound = true
+				directCIDRs = intersectPrefixSets(directCIDRs, c.DirectCIDRs)
+				if !c.BlocksAll {
+					blockCIDRs = intersectPrefixSets(blockCIDRs, c.BlockCIDRs)
+					hasBlockBound = true
 				}
 			}
-			if !hasBlockBound && !combined.hasDomain {
-				combined.blocksAll = true
+			if !hasBlockBound {
+				return TransparentProxyRuleSetIPInfo{
+					DirectCIDRs: directCIDRs,
+					BlocksAll:   true,
+				}
 			}
-			return combined
+			return TransparentProxyRuleSetIPInfo{
+				DirectCIDRs: directCIDRs,
+				BlockCIDRs:  blockCIDRs,
+			}
 		default:
-			return nativeRuleExclusionClass{opaque: true}
+			return TransparentProxyRuleSetIPInfo{Opaque: true}
 		}
 	default:
-		return nativeRuleExclusionClass{opaque: true}
+		return TransparentProxyRuleSetIPInfo{Opaque: true}
 	}
+}
+
+func overlapsPrivateLANUniverse(prefix netip.Prefix) bool {
+	if !prefix.IsValid() {
+		return false
+	}
+	for _, universe := range privateLANUniverse {
+		if universe.Overlaps(prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizePrivateLANSubnets(subnets []netip.Prefix) []netip.Prefix {

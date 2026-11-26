@@ -1599,11 +1599,23 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
                 candidateSession.applicationProcessCredentials
         )
         let sourceSettings = networkSettings(for: sourceSession)
-        let candidateSettings = networkSettings(for: candidateSession)
+        let preCommitDirectExclusions =
+            TransparentProxyNetworkRulePlan.preCommitDirectExcludedNetworks(
+                source: sourceSession.directExcludedNetworks,
+                candidate: candidateSession.directExcludedNetworks
+            )
+        let preCommitSettings = networkSettings(
+            for: candidateSession,
+            directExcludedNetworks: preCommitDirectExclusions
+        )
+        let postCommitSettings: NETransparentProxyNetworkSettings? =
+            preCommitDirectExclusions == candidateSession.directExcludedNetworks
+                ? nil
+                : networkSettings(for: candidateSession)
         let commitID = UUID()
         settingsCommitID = commitID
         settingsCommitInFlight = true
-        setTunnelNetworkSettings(candidateSettings) { error in
+        setTunnelNetworkSettings(preCommitSettings) { error in
             self.engineQueue.async {
                 self.resolveScenarioSwitchSettingsCommit(
                     id: commitID,
@@ -1611,6 +1623,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
                     runtime: runtime,
                     sourceReporter: sourceReporter,
                     sourceSettings: sourceSettings,
+                    postCommitSettings: postCommitSettings,
                     prepared: prepared,
                     candidateEndpoint: candidateEndpoint,
                     candidateReporter: candidateReporter,
@@ -1627,6 +1640,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
                 runtime: runtime,
                 sourceReporter: sourceReporter,
                 sourceSettings: sourceSettings,
+                postCommitSettings: postCommitSettings,
                 prepared: prepared,
                 candidateEndpoint: candidateEndpoint,
                 candidateReporter: candidateReporter,
@@ -1643,6 +1657,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         runtime: EmbeddedSingBoxRuntime,
         sourceReporter: ConnectionTransactionReporter,
         sourceSettings: NETransparentProxyNetworkSettings,
+        postCommitSettings: NETransparentProxyNetworkSettings?,
         prepared: EmbeddedSingBoxRuntime.PreparedSwitch,
         candidateEndpoint: ProviderRelayEndpoint,
         candidateReporter: ConnectionTransactionReporter,
@@ -1858,25 +1873,111 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         }
 
         runtime.beginRuleSetRefreshes()
+        let successResponse = ProviderScenarioSwitchResponse(
+            v: ProviderScenarioSwitchCodec.version,
+            cmd: .switchScenario,
+            requestID: operation.request.requestID,
+            ok: true,
+            sourceTransactionID:
+                operation.request.expectedTransactionID,
+            activeTransactionID:
+                candidateReporter.transactionID,
+            code: nil,
+            message: nil,
+            reportJSON: reportJSON
+        )
+        if let widenedSettings = postCommitSettings {
+            let widenID = UUID()
+            settingsCommitID = widenID
+            settingsCommitInFlight = true
+            setTunnelNetworkSettings(widenedSettings) { widenError in
+                self.engineQueue.async {
+                    self.resolveScenarioSwitchPostCommitSettings(
+                        id: widenID,
+                        operation: operation,
+                        runtime: runtime,
+                        committedReporter: candidateReporter,
+                        directExclusionCount:
+                            prepared.session.directExcludedNetworks.count,
+                        response: successResponse,
+                        error: widenError,
+                        completionHandler: completionHandler
+                    )
+                }
+            }
+            engineQueue.asyncAfter(deadline: .now() + 5) {
+                self.resolveScenarioSwitchPostCommitSettings(
+                    id: widenID,
+                    operation: operation,
+                    runtime: runtime,
+                    committedReporter: candidateReporter,
+                    directExclusionCount:
+                        prepared.session.directExcludedNetworks.count,
+                    response: successResponse,
+                    error: ProviderError.scenarioSwitchCommitTimedOut,
+                    completionHandler: completionHandler
+                )
+            }
+            return
+        }
         finishScenarioSwitch(
             operation,
-            response: ProviderScenarioSwitchResponse(
-                v: ProviderScenarioSwitchCodec.version,
-                cmd: .switchScenario,
-                requestID: operation.request.requestID,
-                ok: true,
-                sourceTransactionID:
-                    operation.request.expectedTransactionID,
-                activeTransactionID:
-                    candidateReporter.transactionID,
-                code: nil,
-                message: nil,
-                reportJSON: reportJSON
-            ),
+            response: successResponse,
             completionHandler: completionHandler
         )
         logger.notice(
             "scenario-switch-committed generation=\(self.generation, privacy: .public) direct-exclusions=\(prepared.session.directExcludedNetworks.count, privacy: .public)"
+        )
+    }
+
+    /// Applies widened direct exclusions only after the candidate generation
+    /// has irreversibly committed. A non-abort failure here never rolls back
+    /// the committed generation because its sing-box still routes those ranges
+    /// to Direct.
+    private func resolveScenarioSwitchPostCommitSettings(
+        id: UUID,
+        operation: ProviderScenarioSwitchOperation,
+        runtime: EmbeddedSingBoxRuntime,
+        committedReporter: ConnectionTransactionReporter,
+        directExclusionCount: Int,
+        response: ProviderScenarioSwitchResponse,
+        error: Error?,
+        completionHandler: @escaping (Data?) -> Void
+    ) {
+        guard settingsCommitID == id else { return }
+        settingsCommitID = nil
+        settingsCommitInFlight = false
+        if let pendingAbort = takePendingCommitAbort() {
+            finishScenarioSwitch(
+                operation,
+                response: response,
+                completionHandler: completionHandler
+            )
+            rollback(
+                runtime: runtime,
+                reporter: committedReporter,
+                error: pendingAbort.error,
+                code: pendingAbort.code,
+                finalState: pendingAbort.finalState,
+                networkSettings: .removeExplicitly,
+                relayDrain: pendingAbort.relayDrain
+            ) {
+                self.finishPendingCommitAbort(pendingAbort)
+            }
+            return
+        }
+        if let error {
+            logger.warning(
+                "scenario-switch-direct-exclusions-update-failed generation=\(self.generation, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
+        }
+        finishScenarioSwitch(
+            operation,
+            response: response,
+            completionHandler: completionHandler
+        )
+        logger.notice(
+            "scenario-switch-committed generation=\(self.generation, privacy: .public) direct-exclusions=\(directExclusionCount, privacy: .public)"
         )
     }
 
@@ -2027,7 +2128,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
     }
 
     private func networkSettings(
-        for session: EmbeddedSingBoxRuntime.Session
+        for session: EmbeddedSingBoxRuntime.Session,
+        directExcludedNetworks: [TransparentProxyRemoteNetwork]? = nil
     ) -> NETransparentProxyNetworkSettings {
         let settings = NETransparentProxyNetworkSettings(
             tunnelRemoteAddress: "127.0.0.1"
@@ -2059,7 +2161,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         ]
         settings.excludedNetworkRules =
             TransparentProxyNetworkRulePlan.excludedRemoteNetworks(
-                directExcludedNetworks: session.directExcludedNetworks
+                directExcludedNetworks:
+                    directExcludedNetworks ?? session.directExcludedNetworks
             ).map {
                 network in
                 NENetworkRule(

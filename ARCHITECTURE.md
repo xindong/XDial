@@ -59,7 +59,7 @@ macOS 主入口为 `NETransparentProxyProvider`，以随机凭据保护的回环
 flow 交给同进程 sing-box。iOS / tvOS 使用 Packet Tunnel；系统 HTTP/SOCKS 代理与 PAC 不是当前入口。
 Transparent Proxy 不接管 ICMP。link-local、multicast、limited broadcast 留在 Underlay；
 RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品硬编码扩展。
-Go 控制面在编译活动 Scenario 时，仅把确定走 Direct、且不与任何非 Direct IP / 应用归因 / MagicDNS 规则或系统 DNS 冲突的私网与当前 Underlay 本地子网下发给 Provider 写入 `excludedNetworkRules`（Tailnet、企业 VPN/代理私网段与 `system_dns` 始终留在盒内），并在场景切换或网络换代时随新 session 原子更新。
+Go 控制面在编译活动 Scenario 时，仅把按规则顺序确定先命中 Direct（或 `route.final = direct`）、且前面没有任何非 Direct 域名 / IP / 应用归因 / MagicDNS / 不透明规则可拦截的私网段（并扣除 `system_dns` 主机地址）下发给 Provider 写入 `excludedNetworkRules`（Tailnet、企业 VPN/代理私网段与 `system_dns` 始终留在盒内）。场景切换时，收紧排除在候选提交前生效，新增排除在候选不可逆提交后才下发，避免未提交候选提前放行连接。
 
 Underlay 来自宿主请求连接前同一时刻的内核默认接口、完整 `NWPath.availableInterfaces`
 与系统 DNS；同一样本另取默认接口的 IPv4 地址与主服务 IPv4 / IPv6 默认路由器，只用于比较。

@@ -223,4 +223,57 @@ final class TransparentProxyNetworkRulePlanTests: XCTestCase {
             )
         )
     }
+
+    func testPreCommitDirectExclusionsNeverWidenBeforeCommit() {
+        let lan192 = TransparentProxyRemoteNetwork(
+            address: "192.168.0.0",
+            prefixLength: 16
+        )
+        let lan10 = TransparentProxyRemoteNetwork(
+            address: "10.0.0.0",
+            prefixLength: 8
+        )
+        let hotspot = TransparentProxyRemoteNetwork(
+            address: "172.20.10.0",
+            prefixLength: 28
+        )
+
+        // All-VPN -> LAN Direct: pre-commit must stay empty so no LAN traffic
+        // bypasses the active VPN before candidate irreversibly commits.
+        XCTAssertEqual(
+            TransparentProxyNetworkRulePlan.preCommitDirectExcludedNetworks(
+                source: [],
+                candidate: [lan192]
+            ),
+            []
+        )
+
+        // LAN Direct -> All-VPN: pre-commit tightens to empty before handoff.
+        XCTAssertEqual(
+            TransparentProxyNetworkRulePlan.preCommitDirectExcludedNetworks(
+                source: [lan192],
+                candidate: []
+            ),
+            []
+        )
+
+        // Pure tightening (Office -> Overseas): pre-commit equals candidate.
+        XCTAssertEqual(
+            TransparentProxyNetworkRulePlan.preCommitDirectExcludedNetworks(
+                source: [lan10, lan192],
+                candidate: [lan192]
+            ),
+            [lan192]
+        )
+
+        // Disjoint network change: old subnet is tightened pre-commit, new
+        // subnet is deferred until post-commit.
+        XCTAssertEqual(
+            TransparentProxyNetworkRulePlan.preCommitDirectExcludedNetworks(
+                source: [lan192],
+                candidate: [hotspot]
+            ),
+            []
+        )
+    }
 }

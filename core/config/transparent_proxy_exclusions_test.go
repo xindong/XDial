@@ -75,6 +75,13 @@ func testOverseasProfile() *Profile {
 				CIDRs:   []string{"10.0.0.0/8", "172.27.0.0/16"},
 			},
 			{
+				ID:      "corp-cidrs-only",
+				Name:    "公司内网网段",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				CIDRs:   []string{"10.0.0.0/8", "172.27.0.0/16"},
+			},
+			{
 				ID:               "cn-domains",
 				Name:             "国内网站",
 				Type:             RuleSetTypeURL,
@@ -104,13 +111,30 @@ func testOverseasProfile() *Profile {
 				DefaultLineID: "direct",
 			},
 			{
-				ID:   "domestic",
-				Name: "在国内",
+				ID:   "domain-before-lan",
+				Name: "域名优先于局域网",
 				Bindings: []RuleBinding{
 					{RuleSetID: "intranet", LineID: "corp"},
 					{RuleSetID: "lan", LineID: "direct"},
 				},
 				DefaultLineID: "corp",
+			},
+			{
+				ID:   "cidr-only-vpn-before-lan",
+				Name: "纯网段 VPN 优先于局域网",
+				Bindings: []RuleBinding{
+					{RuleSetID: "corp-cidrs-only", LineID: "corp"},
+					{RuleSetID: "lan", LineID: "direct"},
+				},
+				DefaultLineID: "corp",
+			},
+			{
+				ID:   "ip-only-vpn-default-direct",
+				Name: "纯网段 VPN 默认直连",
+				Bindings: []RuleBinding{
+					{RuleSetID: "corp-cidrs-only", LineID: "corp"},
+				},
+				DefaultLineID: "direct",
 			},
 			{
 				ID:            "all-vpn",
@@ -130,8 +154,8 @@ func testOverseasProfile() *Profile {
 func TestComputeDirectExcludedNetworks_OverseasExcludesLANAndProtectsVPNAndDNS(t *testing.T) {
 	profile := testOverseasProfile()
 	ruleInfo := map[string]TransparentProxyRuleSetIPInfo{
-		"cn-domains": {HasDomain: true, ExactIPs: true},
-		"cn-ip":      {ExactIPs: true, CIDRs: nil}, // Public China IPs have no private overlap
+		"cn-domains": {BlocksAll: true},
+		"cn-ip":      {}, // Public China IPs have no private overlap
 	}
 
 	// Case 1: public system DNS -> whole 192.168.0.0/16 excluded cleanly as 1 CIDR.
@@ -171,47 +195,66 @@ func TestComputeDirectExcludedNetworks_OverseasExcludesLANAndProtectsVPNAndDNS(t
 	}
 }
 
-func TestComputeDirectExcludedNetworks_UnderlayLocalSubnetOutsideExplicitLAN(t *testing.T) {
+func TestComputeDirectExcludedNetworks_PreservesEarlierNonDirectDomainPrecedence(t *testing.T) {
 	profile := testOverseasProfile()
-	ruleInfo := map[string]TransparentProxyRuleSetIPInfo{
-		"cn-domains": {HasDomain: true, ExactIPs: true},
-		"cn-ip":      {ExactIPs: true},
+	local := []netip.Prefix{netip.MustParsePrefix("192.168.68.0/22")}
+	dns := []string{"192.168.68.1"}
+
+	// Case 1: corp.example -> VPN BEFORE 192.168.0.0/16 -> Direct.
+	// A corporate hostname resolving to 192.168.1.20 must hit the earlier VPN
+	// binding in sing-box, so nothing after the VPN domain rule may be excluded.
+	profile.ActiveScenarioID = "domain-before-lan"
+	gotDomainBeforeLAN, err := ComputeTransparentProxyDirectExcludedNetworks(profile, dns, local)
+	if err != nil {
+		t.Fatalf("domain-before-lan error: %v", err)
+	}
+	if len(gotDomainBeforeLAN) != 0 {
+		t.Fatalf("earlier non-Direct domain rule must prevent excluding later LAN CIDRs, got %+v", gotDomainBeforeLAN)
 	}
 
-	// Hotspot subnet 172.20.10.0/28 does not overlap VPN's 172.27.0.0/16 or 10.0.0.0/8.
-	got, err := ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
+	// Case 2: overseas has intranet/cn-domains -> VPN BEFORE route.final = direct.
+	// A local hotspot subnet (172.20.10.0/28) that is NOT covered by an earlier
+	// explicit direct binding must NOT bypass the preceding VPN domain rules.
+	profile.ActiveScenarioID = "overseas"
+	gotOverseasHotspot, err := ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 		profile,
 		[]string{"172.20.10.1"},
 		[]netip.Prefix{netip.MustParsePrefix("172.20.10.0/28")},
-		ruleInfo,
+		map[string]TransparentProxyRuleSetIPInfo{
+			"cn-domains": {BlocksAll: true},
+			"cn-ip":      {},
+		},
 	)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("overseas hotspot error: %v", err)
 	}
-	if !excludedContainsIP(t, got, "172.20.10.5") {
-		t.Errorf("expected hotspot peer 172.20.10.5 to be excluded, got %+v", got)
+	if excludedContainsIP(t, gotOverseasHotspot, "172.20.10.5") {
+		t.Fatalf("fallback local subnet after non-Direct domain rules must stay captured: %+v", gotOverseasHotspot)
 	}
-	if !excludedContainsIP(t, got, "192.168.68.83") {
-		t.Errorf("expected explicit LAN 192.168.68.83 to be excluded, got %+v", got)
-	}
-	for _, mustCapture := range []string{"172.20.10.1", "172.27.1.1", "172.18.0.5", "10.1.2.3"} {
-		if excludedContainsIP(t, got, mustCapture) {
-			t.Errorf("expected %s to remain captured, got %+v", mustCapture, got)
-		}
+	if !excludedContainsIP(t, gotOverseasHotspot, "192.168.68.83") {
+		t.Fatalf("explicit LAN binding BEFORE VPN domain rules must still be excluded: %+v", gotOverseasHotspot)
 	}
 
-	// If local subnet IS inside company VPN CIDR (e.g., 10.20.0.0/16), it must NOT be excluded.
-	gotInVPN, err := ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
+	// Case 3: Pure IP VPN rules (no domain rules) BEFORE default: direct.
+	// Non-conflicting LAN / hotspot subnets ARE excluded while VPN CIDRs stay captured.
+	profile.ActiveScenarioID = "ip-only-vpn-default-direct"
+	gotIPOnlyVPN, err := ComputeTransparentProxyDirectExcludedNetworks(
 		profile,
-		[]string{"10.20.0.1"},
-		[]netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")},
-		ruleInfo,
+		[]string{"172.20.10.1"},
+		[]netip.Prefix{netip.MustParsePrefix("172.20.10.0/28")},
 	)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ip-only-vpn error: %v", err)
 	}
-	if excludedContainsIP(t, gotInVPN, "10.20.0.50") {
-		t.Errorf("local subnet overlapping VPN CIDR must never be excluded: %+v", gotInVPN)
+	for _, peer := range []string{"172.20.10.5", "192.168.68.83"} {
+		if !excludedContainsIP(t, gotIPOnlyVPN, peer) {
+			t.Errorf("expected %s to be excluded when only non-overlapping VPN CIDRs precede final:direct: %+v", peer, gotIPOnlyVPN)
+		}
+	}
+	for _, mustCapture := range []string{"172.20.10.1", "172.27.1.1", "10.1.2.3"} {
+		if excludedContainsIP(t, gotIPOnlyVPN, mustCapture) {
+			t.Errorf("expected %s to remain captured: %+v", mustCapture, gotIPOnlyVPN)
+		}
 	}
 }
 
@@ -220,20 +263,20 @@ func TestComputeDirectExcludedNetworks_ScenarioSwitchingUpdatesExclusions(t *tes
 	local := []netip.Prefix{netip.MustParsePrefix("192.168.68.0/22")}
 	dns := []string{"192.168.68.1"}
 
-	// 1. Domestic: intranet -> vpn, lan -> direct, default -> vpn
-	profile.ActiveScenarioID = "domestic"
-	domestic, err := ComputeTransparentProxyDirectExcludedNetworks(profile, dns, local)
+	// 1. Pure CIDR VPN (10/8, 172.27/16) -> VPN, then LAN (192.168/16) -> Direct, default -> VPN.
+	profile.ActiveScenarioID = "cidr-only-vpn-before-lan"
+	cidrVPN, err := ComputeTransparentProxyDirectExcludedNetworks(profile, dns, local)
 	if err != nil {
-		t.Fatalf("domestic error: %v", err)
+		t.Fatalf("cidr-only-vpn-before-lan error: %v", err)
 	}
-	if !excludedContainsIP(t, domestic, "192.168.68.83") {
-		t.Errorf("domestic should exclude LAN peer 192.168.68.83: %+v", domestic)
+	if !excludedContainsIP(t, cidrVPN, "192.168.68.83") {
+		t.Errorf("cidr-only-vpn-before-lan should exclude LAN peer 192.168.68.83: %+v", cidrVPN)
 	}
-	if excludedContainsIP(t, domestic, "192.168.68.1") || excludedContainsIP(t, domestic, "10.1.1.1") || excludedContainsIP(t, domestic, "172.27.1.1") {
-		t.Errorf("domestic must keep DNS and VPN ranges captured: %+v", domestic)
+	if excludedContainsIP(t, cidrVPN, "192.168.68.1") || excludedContainsIP(t, cidrVPN, "10.1.1.1") || excludedContainsIP(t, cidrVPN, "172.27.1.1") {
+		t.Errorf("cidr-only-vpn-before-lan must keep DNS and VPN ranges captured: %+v", cidrVPN)
 	}
 
-	// 2. All-VPN: default -> vpn, no LAN direct rule
+	// 2. All-VPN: default -> vpn, no LAN direct rule.
 	profile.ActiveScenarioID = "all-vpn"
 	allVPN, err := ComputeTransparentProxyDirectExcludedNetworks(profile, dns, local)
 	if err != nil {
@@ -243,7 +286,7 @@ func TestComputeDirectExcludedNetworks_ScenarioSwitchingUpdatesExclusions(t *tes
 		t.Fatalf("all-vpn must not exclude any LAN networks, got %+v", allVPN)
 	}
 
-	// 3. Office: default -> direct, no non-direct rules at all -> all RFC1918 + ULA minus DNS
+	// 3. Office: default -> direct, no non-direct rules at all -> all RFC1918 + ULA minus DNS.
 	profile.ActiveScenarioID = "office"
 	office, err := ComputeTransparentProxyDirectExcludedNetworks(profile, dns, local)
 	if err != nil {
@@ -416,14 +459,14 @@ func TestComputeDirectExcludedNetworks_TailscaleMagicDNSSafety(t *testing.T) {
 			tsLine,
 		},
 		RuleSets: []RuleSet{{
-			ID:      "only-domain",
+			ID:      "only-cidr",
 			Type:    RuleSetTypeManual,
 			Enabled: true,
-			Domains: []string{"ts-bound.example"},
+			CIDRs:   []string{"10.99.0.0/16"},
 		}},
 		Scenarios: []Scenario{{
 			ID:            "s",
-			Bindings:      []RuleBinding{{RuleSetID: "only-domain", LineID: "ts"}},
+			Bindings:      []RuleBinding{{RuleSetID: "only-cidr", LineID: "ts"}},
 			DefaultLineID: "direct",
 		}},
 		ActiveScenarioID: "s",
@@ -503,8 +546,7 @@ func TestComputeDirectExcludedNetworks_URLAndNativeAndSubscriptionRules(t *testi
 		nil,
 		map[string]TransparentProxyRuleSetIPInfo{
 			"corp-url": {
-				ExactIPs: true,
-				CIDRs:    []netip.Prefix{netip.MustParsePrefix("172.27.0.0/16")},
+				BlockCIDRs: []netip.Prefix{netip.MustParsePrefix("172.27.0.0/16")},
 			},
 		},
 	)
@@ -516,6 +558,35 @@ func TestComputeDirectExcludedNetworks_URLAndNativeAndSubscriptionRules(t *testi
 	}
 	if !excludedContainsIP(t, got, "192.168.68.83") {
 		t.Fatalf("native LAN rule 192.168.0.0/16 should be excluded: %+v", got)
+	}
+
+	// Native logical AND rule bound to direct intersects CIDRs instead of unioning.
+	logicalAndProfile := &Profile{
+		Lines: profile.Lines,
+		RuleSets: []RuleSet{{
+			ID:      "native-and",
+			Type:    RuleSetTypeNative,
+			Enabled: true,
+			NativeRule: json.RawMessage(
+				`{"type":"logical","mode":"and","rules":[{"ip_cidr":["192.168.0.0/16"]},{"ip_cidr":["192.168.1.0/24"]}]}`,
+			),
+		}},
+		Scenarios: []Scenario{{
+			ID:            "s",
+			Bindings:      []RuleBinding{{RuleSetID: "native-and", LineID: "direct"}},
+			DefaultLineID: "corp",
+		}},
+		ActiveScenarioID: "s",
+	}
+	gotAnd, err := ComputeTransparentProxyDirectExcludedNetworks(logicalAndProfile, []string{"1.1.1.1"}, nil)
+	if err != nil {
+		t.Fatalf("native logical AND error: %v", err)
+	}
+	if !excludedContainsIP(t, gotAnd, "192.168.1.10") {
+		t.Fatalf("native logical AND intersection 192.168.1.0/24 should be excluded: %+v", gotAnd)
+	}
+	if excludedContainsIP(t, gotAnd, "192.168.2.1") {
+		t.Fatalf("native logical AND must not exclude addresses outside /24 intersection: %+v", gotAnd)
 	}
 
 	// Opaque URL rule set before direct rule fails closed.
@@ -579,6 +650,19 @@ func TestComputeDirectExcludedNetworks_URLAndNativeAndSubscriptionRules(t *testi
 	}
 	if !excludedContainsIP(t, gotSub, "192.168.68.83") || !excludedContainsIP(t, gotSub, "172.16.5.5") {
 		t.Fatalf("subscription GEOIP,LAN -> DIRECT should exclude remaining LAN ranges: %+v", gotSub)
+	}
+
+	// Subscription non-Direct domain rule BEFORE GEOIP,LAN -> DIRECT blocks LAN exclusion.
+	subProfile.Subscriptions[0].Rules = []SubscriptionRule{
+		{Type: "DOMAIN-SUFFIX", Value: "corp.example", Group: "__default__"},
+		{Type: "GEOIP", Value: "LAN", Group: "DIRECT"},
+	}
+	gotSubDomainFirst, err := ComputeTransparentProxyDirectExcludedNetworks(subProfile, []string{"1.1.1.1"}, nil)
+	if err != nil {
+		t.Fatalf("subscription domain-first error: %v", err)
+	}
+	if len(gotSubDomainFirst) != 0 {
+		t.Fatalf("subscription non-Direct domain rule before GEOIP,LAN must block exclusion, got %+v", gotSubDomainFirst)
 	}
 }
 

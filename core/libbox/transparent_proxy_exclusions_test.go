@@ -44,6 +44,8 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	cnDomainURL := "https://rules.example/cn-domains.json"
 	cnIPURL := "https://rules.example/cn-ip.json"
 	corpURL := "https://rules.example/corp-ip.json"
+	directAndURL := "https://rules.example/direct-and.json"
+	directPortURL := "https://rules.example/direct-port.json"
 
 	writeRuleCache := func(ruleID, rawURL, body string) {
 		t.Helper()
@@ -55,6 +57,8 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	writeRuleCache("cn-domains", cnDomainURL, `{"version":2,"rules":[{"domain_suffix":["cn.example"]}]}`)
 	writeRuleCache("cn-ip", cnIPURL, `{"version":2,"rules":[{"ip_cidr":["114.114.114.0/24","223.5.5.0/24"]}]}`)
 	writeRuleCache("corp-ip", corpURL, `{"version":2,"rules":[{"ip_cidr":["172.27.0.0/16","192.168.99.0/24"]}]}`)
+	writeRuleCache("direct-and", directAndURL, `{"version":2,"rules":[{"type":"logical","mode":"and","rules":[{"ip_cidr":["192.168.0.0/16"]},{"ip_cidr":["192.168.1.0/24"]}]}]}`)
+	writeRuleCache("direct-port", directPortURL, `{"version":2,"rules":[{"ip_cidr":["192.168.0.0/16"],"port":[443]}]}`)
 
 	makeProfile := func(activeScenarioID string) string {
 		profile := config.Profile{
@@ -73,9 +77,12 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 			RuleSets: []config.RuleSet{
 				{ID: "lan", Name: "本地局域网", Type: config.RuleSetTypeManual, Enabled: true, CIDRs: []string{"192.168.0.0/16"}},
 				{ID: "intranet", Name: "公司内网", Type: config.RuleSetTypeManual, Enabled: true, Domains: []string{"corp.example"}, CIDRs: []string{"10.0.0.0/8"}},
+				{ID: "corp-cidr-only", Name: "公司网段", Type: config.RuleSetTypeManual, Enabled: true, CIDRs: []string{"10.0.0.0/8"}},
 				{ID: "cn-domains", Name: "国内网站", Type: config.RuleSetTypeURL, Enabled: true, URL: cnDomainURL, Format: "json"},
 				{ID: "cn-ip", Name: "国内 IP", Type: config.RuleSetTypeURL, Enabled: true, URL: cnIPURL, Format: "json"},
 				{ID: "corp-ip", Name: "企业 URL IP", Type: config.RuleSetTypeURL, Enabled: true, URL: corpURL, Format: "json"},
+				{ID: "direct-and", Name: "交集直连", Type: config.RuleSetTypeURL, Enabled: true, URL: directAndURL, Format: "json"},
+				{ID: "direct-port", Name: "端口直连", Type: config.RuleSetTypeURL, Enabled: true, URL: directPortURL, Format: "json"},
 			},
 			Scenarios: []config.Scenario{
 				{
@@ -90,11 +97,35 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 					DefaultLineID: "direct",
 				},
 				{
+					ID:   "ip-only-vpn",
+					Name: "纯网段 VPN",
+					Bindings: []config.RuleBinding{
+						{RuleSetID: "corp-cidr-only", LineID: "company"},
+					},
+					DefaultLineID: "direct",
+				},
+				{
 					ID:   "corp-url-first",
 					Name: "企业优先",
 					Bindings: []config.RuleBinding{
 						{RuleSetID: "corp-ip", LineID: "company"},
 						{RuleSetID: "lan", LineID: "direct"},
+					},
+					DefaultLineID: "company",
+				},
+				{
+					ID:   "direct-and-only",
+					Name: "逻辑交集直连",
+					Bindings: []config.RuleBinding{
+						{RuleSetID: "direct-and", LineID: "direct"},
+					},
+					DefaultLineID: "company",
+				},
+				{
+					ID:   "direct-port-only",
+					Name: "端口条件直连",
+					Bindings: []config.RuleBinding{
+						{RuleSetID: "direct-port", LineID: "direct"},
 					},
 					DefaultLineID: "company",
 				},
@@ -142,10 +173,10 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 		t.Fatalf("company VPN 10.0.0.0/8 must stay captured: %+v", overseasSession.DirectExcludedNetworks)
 	}
 
-	// 2. Network change to en7 (172.20.10.0/28, DNS 172.20.10.1) in overseas scenario:
-	// New Underlay local subnet is excluded (minus its router DNS).
+	// 2. Network change to en7 (172.20.10.0/28, DNS 172.20.10.1) with ip-only-vpn:
+	// Non-overlapping Underlay subnet is excluded (minus its router DNS), VPN 10/8 stays captured.
 	rawEn7, err := GenerateTransparentProxySession(
-		makeProfile("overseas"),
+		makeProfile("ip-only-vpn"),
 		basePath,
 		29877,
 		"session-user",
@@ -163,8 +194,9 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	if !sessionExcludedContainsIP(t, en7Session.DirectExcludedNetworks, "172.20.10.5") {
 		t.Fatalf("expected en7 local subnet peer 172.20.10.5 to be excluded: %+v", en7Session.DirectExcludedNetworks)
 	}
-	if sessionExcludedContainsIP(t, en7Session.DirectExcludedNetworks, "172.20.10.1") {
-		t.Fatalf("en7 system DNS 172.20.10.1 must stay captured: %+v", en7Session.DirectExcludedNetworks)
+	if sessionExcludedContainsIP(t, en7Session.DirectExcludedNetworks, "172.20.10.1") ||
+		sessionExcludedContainsIP(t, en7Session.DirectExcludedNetworks, "10.1.2.3") {
+		t.Fatalf("en7 system DNS and VPN CIDR must stay captured: %+v", en7Session.DirectExcludedNetworks)
 	}
 
 	// 3. URL rule set with private VPN CIDR (192.168.99.0/24) before LAN -> direct:
@@ -193,11 +225,57 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 		t.Fatalf("non-conflicting LAN peer should be excluded: %+v", corpURLSession.DirectExcludedNetworks)
 	}
 
-	// 4. Scenario switch to all-vpn clears direct_excluded_networks completely.
+	// 4. Direct URL rule set with logical AND (192.168.0.0/16 AND 192.168.1.0/24):
+	// Only the /24 intersection may be excluded; 192.168.2.1 must stay on default VPN.
+	rawDirectAnd, err := GenerateTransparentProxySession(
+		makeProfile("direct-and-only"),
+		basePath,
+		29879,
+		"session-user",
+		"session-password",
+		"en0",
+		`["1.1.1.1"]`,
+	)
+	if err != nil {
+		t.Fatalf("direct-and-only GenerateTransparentProxySession: %v", err)
+	}
+	var directAndSession transparentProxySession
+	if err := json.Unmarshal([]byte(rawDirectAnd), &directAndSession); err != nil {
+		t.Fatal(err)
+	}
+	if !sessionExcludedContainsIP(t, directAndSession.DirectExcludedNetworks, "192.168.1.5") {
+		t.Fatalf("expected logical AND intersection 192.168.1.0/24 to be excluded: %+v", directAndSession.DirectExcludedNetworks)
+	}
+	if sessionExcludedContainsIP(t, directAndSession.DirectExcludedNetworks, "192.168.2.1") {
+		t.Fatalf("logical AND URL rule set must not exclude addresses outside intersection: %+v", directAndSession.DirectExcludedNetworks)
+	}
+
+	// 5. Direct URL rule set with port predicate is opaque and must NOT exclude IPs.
+	rawDirectPort, err := GenerateTransparentProxySession(
+		makeProfile("direct-port-only"),
+		basePath,
+		29880,
+		"session-user",
+		"session-password",
+		"en0",
+		`["1.1.1.1"]`,
+	)
+	if err != nil {
+		t.Fatalf("direct-port-only GenerateTransparentProxySession: %v", err)
+	}
+	var directPortSession transparentProxySession
+	if err := json.Unmarshal([]byte(rawDirectPort), &directPortSession); err != nil {
+		t.Fatal(err)
+	}
+	if len(directPortSession.DirectExcludedNetworks) != 0 {
+		t.Fatalf("port-scoped Direct URL rule set must not exclude all ports, got %+v", directPortSession.DirectExcludedNetworks)
+	}
+
+	// 6. Scenario switch to all-vpn clears direct_excluded_networks completely.
 	rawAllVPN, err := GenerateTransparentProxySession(
 		makeProfile("all-vpn"),
 		basePath,
-		29879,
+		29881,
 		"session-user",
 		"session-password",
 		"en0",
