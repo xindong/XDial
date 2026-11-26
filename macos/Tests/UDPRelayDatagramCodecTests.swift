@@ -114,6 +114,38 @@ final class UDPRelayDatagramCodecTests: XCTestCase {
         XCTAssertNil(try codec.decode(packet: unknown))
     }
 
+    func testMultipleDirectDestinationsAndUnsolicitedPeerRepliesKeepExactEndpoints() throws {
+        let stunA = Network.NWEndpoint.hostPort(
+            host: .ipv4(IPv4Address("74.125.250.129")!), port: 19302
+        )
+        let stunB = Network.NWEndpoint.hostPort(
+            host: .ipv4(IPv4Address("162.159.207.0")!), port: 3478
+        )
+        let peerC = Network.NWEndpoint.hostPort(
+            host: .ipv4(IPv4Address("47.237.144.245")!), port: 3479
+        )
+        let codec = UDPRelayDatagramCodec(initialDestination: stunA)
+
+        let packetA = try codec.encode(
+            payload: Data("req-a".utf8), destination: stunA, remoteHostname: nil
+        )
+        let packetB = try codec.encode(
+            payload: Data("req-b".utf8), destination: stunB, remoteHostname: nil
+        )
+        XCTAssertEqual(try codec.decode(packet: packetA)?.endpoint, stunA)
+        XCTAssertEqual(try codec.decode(packet: packetB)?.endpoint, stunB)
+
+        // An unsolicited Full-Cone reply from a third remote endpoint that was
+        // never sent to first must still decode with its exact source endpoint.
+        var unsolicited = Data([0x00, 0x00, 0x00, 0x01])
+        unsolicited.append(IPv4Address("47.237.144.245")!.rawValue)
+        unsolicited.append(contentsOf: [UInt8(3479 >> 8), UInt8(3479 & 0xff)])
+        unsolicited.append(Data("punch-c".utf8))
+        let decodedC = try XCTUnwrap(codec.decode(packet: unsolicited))
+        XCTAssertEqual(decodedC.endpoint, peerC)
+        XCTAssertEqual(decodedC.payload, Data("punch-c".utf8))
+    }
+
     func testDomainReplyWithoutAnyKnownDestinationIsDropped() throws {
         let codec = UDPRelayDatagramCodec()
 
