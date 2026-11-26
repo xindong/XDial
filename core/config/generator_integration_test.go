@@ -243,25 +243,80 @@ func TestGenerate_NETailscale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("[tailscale-ne] GenerateSingBoxFor: %v", err)
 	}
+	singboxCheckConfig(t, data, "tailscale-ne")
+}
 
-	// xdial-mobile 是 App 内注册的 libbox DNS transport，命令行 sing-box 不认识。
-	// 这里只把 DNS 替换为标准 transport，让官方 validator 继续覆盖 Tailscale
-	// endpoint 和其余原生配置字段；自定义 transport 由 core/libbox 测试覆盖。
+func TestGenerate_NEScenarioDNS(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{directLine(), vpnLine(), trojanLine()},
+		RuleSets: []RuleSet{
+			internalRuleSet(),
+			{
+				ID:               "cn-domains",
+				Name:             "国内网站",
+				Type:             RuleSetTypeURL,
+				Enabled:          true,
+				URL:              "https://rules.example/geosite-cn.srs",
+				Format:           "binary",
+				RuntimeMatchKind: RuleSetMatchDomain,
+			},
+			{
+				ID:               "cn-ips",
+				Name:             "国内 IP",
+				Type:             RuleSetTypeURL,
+				Enabled:          true,
+				URL:              "https://rules.example/geoip-cn.srs",
+				Format:           "binary",
+				RuntimeMatchKind: RuleSetMatchIP,
+			},
+		},
+		Scenarios: []Scenario{{
+			ID:   "cn",
+			Name: "在国内",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "cn-domains", LineID: "direct"},
+				{RuleSetID: "cn-ips", LineID: "direct"},
+			},
+			DefaultLineID: "vpn",
+		}},
+		ActiveScenarioID: "cn",
+	}
+
+	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatalf("[ne-scenario-dns] GenerateSingBoxFor: %v", err)
+	}
+
+	// Replace only libbox-registered custom outbound/DNS transport types so the
+	// standalone sing-box binary validates the full Scenario DNS rules,
+	// strategy:"ipv4_only", independent_cache, and rule_set references.
 	var cfg map[string]interface{}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("[tailscale-ne] decode: %v", err)
+		t.Fatalf("[ne-scenario-dns] decode: %v", err)
 	}
-	cfg["dns"] = map[string]interface{}{
-		"servers": []map[string]interface{}{{
-			"type": "udp", "tag": mobilePublicDNSTag, "server": "1.1.1.1", "server_port": 53,
-		}},
-		"final": mobilePublicDNSTag,
+	for _, raw := range cfg["outbounds"].([]interface{}) {
+		out := raw.(map[string]interface{})
+		if out["type"] == "vpn" {
+			out["type"] = "direct"
+		}
+	}
+	dnsObj := cfg["dns"].(map[string]interface{})
+	for _, raw := range dnsObj["servers"].([]interface{}) {
+		server := raw.(map[string]interface{})
+		switch server["type"] {
+		case "xdial-underlay", "xdial-anyconnect":
+			delete(server, "fallback")
+			server["type"] = "udp"
+			server["server"] = "192.0.2.53"
+			server["server_port"] = 53
+		}
 	}
 	checkData, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		t.Fatalf("[tailscale-ne] encode validator config: %v", err)
+		t.Fatalf("[ne-scenario-dns] encode: %v", err)
 	}
-	singboxCheckConfig(t, checkData, "tailscale-ne")
+	singboxCheckConfig(t, checkData, "ne-scenario-dns")
 }
 
 // 1. 纯手动线路，无订阅（原有功能）

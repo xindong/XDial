@@ -34,6 +34,7 @@ const (
 	connectivityDirectRuleSetID   = "xdial-connectivity-direct"
 	connectivityOutboundRuleSetID = "xdial-connectivity-anyconnect"
 	mobilePublicDNSTag            = "xdial-public-dns"
+	mobileDirectDNSTag            = "xdial-direct-dns"
 	mobileDispatcherDNSTag        = "xdial-mobile-dns"
 	transparentSystemDNSTag       = "xdial-system-dns"
 	transparentEnterpriseDNSTag   = "xdial-anyconnect-dns"
@@ -42,6 +43,9 @@ const (
 	// MobilePublicDNSTag is exported because it is also how Direct resolves its
 	// own hostnames in the Network Extension (route default_domain_resolver).
 	MobilePublicDNSTag = mobilePublicDNSTag
+	// MobileDirectDNSTag is the interface-scoped Underlay resolver used by
+	// Direct-bound domain rules in Apple Network Extensions.
+	MobileDirectDNSTag = mobileDirectDNSTag
 	// TransparentNativeDNSTag is exported so isolated Direct RuleSet refresh
 	// sessions use the same macOS-native resolver contract as Direct traffic.
 	TransparentNativeDNSTag       = "xdial-native-dns"
@@ -590,8 +594,8 @@ func generateSingBox(
 		}
 	}
 
-	// 两个平台的系统 DNS 包都走 hijack-dns：桌面交给 buildDNS 的解析链，
-	// NE 交给 xdial-mobile dispatcher。
+	// 两个平台的系统 DNS 包都走 hijack-dns：按 Scenario 规则交由对应 Line 的
+	// resolver 处理。
 	routeRules := buildSystemRouteRules(platform == PlatformMacOS)
 	if platform.isNetworkExtension() {
 		routeRules = buildNESystemRouteRules()
@@ -749,7 +753,7 @@ func generateSingBox(
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
-	dnsConfig := buildNEDNS(activeMagicDNSTags)
+	var dnsConfig map[string]interface{}
 	if platform.isTransparentProxy() {
 		var dnsErr error
 		dnsConfig, dnsErr = buildTransparentProxyDNS(
@@ -770,7 +774,22 @@ func generateSingBox(
 			return nil, dnsErr
 		}
 		markLineOwnedFlowAddressCorrection(routeRules, dnsConfig)
-	} else if !platform.isNetworkExtension() {
+	} else if platform.isNetworkExtension() {
+		var dnsErr error
+		dnsConfig, dnsErr = buildNEDNS(
+			profile,
+			scenario,
+			subTagMap,
+			subGroupTagMap,
+			validTags,
+			activeMagicDNSTags,
+			defaultTag,
+			systemDNS != nil,
+		)
+		if dnsErr != nil {
+			return nil, dnsErr
+		}
+	} else {
 		dnsConfig = buildDNS(
 			enterpriseDNS,
 			collectVPNBoundDomains(profile, scenario),
@@ -1312,7 +1331,28 @@ func buildDNS(
 	return config
 }
 
-func buildNEDNS(tailscaleTags []string) map[string]interface{} {
+func neResolverForOutbound(profile *Profile, outTag, directResolverTag string) (resolverTag, strategy string) {
+	if outTag == "direct" || selectedGroupUsesDirect(profile, outTag) {
+		return directResolverTag, ""
+	}
+	if outTag == "vpn" {
+		// AnyConnect bridge (vpnOutbound) is IPv4-only; suppress AAAA answers so
+		// clients do not attempt unreachable IPv6 connections over the VPN line.
+		return transparentEnterpriseDNSTag, "ipv4_only"
+	}
+	return desktopProxyDNSTag(outTag), ""
+}
+
+func buildNEDNS(
+	profile *Profile,
+	scenario *Scenario,
+	subTagMap map[string]string,
+	subGroupTagMap map[string]map[string]string,
+	validTags map[string]bool,
+	tailscaleTags []string,
+	defaultOutboundTag string,
+	useCapturedSystemDNS bool,
+) (map[string]interface{}, error) {
 	servers := []map[string]interface{}{
 		{
 			"type":        "udp",
@@ -1321,33 +1361,167 @@ func buildNEDNS(tailscaleTags []string) map[string]interface{} {
 			"server_port": 53,
 		},
 	}
-	bindings := make([]map[string]interface{}, 0, len(tailscaleTags))
+	seenResolver := map[string]bool{
+		mobilePublicDNSTag: true,
+	}
+	directResolverTag := mobileDirectDNSTag
+	if useCapturedSystemDNS {
+		directResolverTag = mobilePublicDNSTag
+	}
+
+	var rules []map[string]interface{}
 	for _, endpointTag := range tailscaleTags {
 		serverTag := mobileTailscaleDNSTag(endpointTag)
 		servers = append(servers, buildTailnetDNSServer(endpointTag))
-		bindings = append(bindings, map[string]interface{}{
-			"endpoint": endpointTag,
-			"server":   serverTag,
+		seenResolver[serverTag] = true
+		rules = append(rules, buildTailnetDNSRules(serverTag)...)
+	}
+
+	ensureResolver := func(resolverTag, outTag string) {
+		if seenResolver[resolverTag] {
+			return
+		}
+		seenResolver[resolverTag] = true
+		switch resolverTag {
+		case mobileDirectDNSTag:
+			servers = append(servers, map[string]interface{}{
+				"type":     "xdial-underlay",
+				"tag":      mobileDirectDNSTag,
+				"fallback": mobilePublicDNSTag,
+			})
+		case transparentEnterpriseDNSTag:
+			servers = append(servers, map[string]interface{}{
+				"type": "xdial-anyconnect",
+				"tag":  transparentEnterpriseDNSTag,
+			})
+		default:
+			servers = append(servers, map[string]interface{}{
+				"type":   "https",
+				"tag":    resolverTag,
+				"server": transparentProxyDoHIPv4Server,
+				"detour": outTag,
+				"tls": map[string]interface{}{
+					"enabled":     true,
+					"server_name": "one.one.one.one",
+				},
+			})
+		}
+	}
+
+	// 按 Scenario 显式绑定顺序编译域名 DNS 分流（ARCHITECTURE §4.1）：
+	// 纯 IP 与不可安全拆分的混合规则不参与域名阶段分流，也不截断后续绑定。
+	if profile != nil && scenario != nil {
+		for index := range scenario.Bindings {
+			binding := &scenario.Bindings[index]
+			ruleSet := profile.FindRuleSet(binding.RuleSetID)
+			if ruleSet == nil || !ruleSet.Enabled {
+				continue
+			}
+			outTag := bindingOutboundTag(profile, binding, subTagMap, validTags)
+			if outTag == "" {
+				continue
+			}
+			resolverTag, strategy := neResolverForOutbound(profile, outTag, directResolverTag)
+			switch ruleSet.Type {
+			case RuleSetTypeNative:
+				if !nativeRuleDomainOnly(ruleSet.NativeRule) {
+					continue
+				}
+				ensureResolver(resolverTag, outTag)
+				rule := map[string]interface{}{
+					"rule_set": sbRuleSetTag(ruleSet),
+					"server":   resolverTag,
+				}
+				applyRuleSetInvert(rule, ruleSet)
+				if strategy != "" {
+					rule["strategy"] = strategy
+				}
+				rules = append(rules, rule)
+			case RuleSetTypeManual:
+				if len(ruleSet.Domains) > 0 && (!ruleSet.Invert || len(ruleSet.CIDRs) == 0) {
+					ensureResolver(resolverTag, outTag)
+					rule := map[string]interface{}{
+						"domain_suffix": ruleSet.Domains,
+						"server":        resolverTag,
+					}
+					applyRuleSetInvert(rule, ruleSet)
+					if strategy != "" {
+						rule["strategy"] = strategy
+					}
+					rules = append(rules, rule)
+				}
+			case RuleSetTypeURL:
+				if ruleSet.RuntimeMatchKind != RuleSetMatchDomain {
+					continue
+				}
+				ensureResolver(resolverTag, outTag)
+				rule := map[string]interface{}{
+					"rule_set": sbRuleSetTag(ruleSet),
+					"server":   resolverTag,
+				}
+				applyRuleSetInvert(rule, ruleSet)
+				if strategy != "" {
+					rule["strategy"] = strategy
+				}
+				rules = append(rules, rule)
+			}
+		}
+
+		for _, sub := range profile.Subscriptions {
+			groupTags := subGroupTagMap[sub.ID]
+			if groupTags == nil {
+				continue
+			}
+			compiled, _, err := collectSubscriptionRules(&sub, groupTags)
+			if err != nil {
+				return nil, fmt.Errorf("compile subscription %q NE DNS rules: %w", sub.ID, err)
+			}
+			for _, compiledRule := range compiled {
+				if !compiledRule.domain {
+					continue
+				}
+				if compiledRule.outTag == rejectTag {
+					rules = append(rules, map[string]interface{}{
+						compiledRule.matchKey: compiledRule.values,
+						"action":              "reject",
+					})
+					continue
+				}
+				resolverTag, strategy := neResolverForOutbound(profile, compiledRule.outTag, directResolverTag)
+				ensureResolver(resolverTag, compiledRule.outTag)
+				rule := map[string]interface{}{
+					compiledRule.matchKey: compiledRule.values,
+					"server":              resolverTag,
+				}
+				if strategy != "" {
+					rule["strategy"] = strategy
+				}
+				rules = append(rules, rule)
+			}
+		}
+	}
+
+	if defaultOutboundTag == "" {
+		defaultOutboundTag = "direct"
+	}
+	defaultResolverTag, defaultStrategy := neResolverForOutbound(profile, defaultOutboundTag, directResolverTag)
+	ensureResolver(defaultResolverTag, defaultOutboundTag)
+	if defaultStrategy != "" {
+		rules = append(rules, map[string]interface{}{
+			"server":   defaultResolverTag,
+			"strategy": defaultStrategy,
 		})
 	}
-	servers = append(servers, map[string]interface{}{
-		"type":            "xdial-mobile",
-		"tag":             mobileDispatcherDNSTag,
-		"public_fallback": mobilePublicDNSTag,
-		"tailscale":       bindings,
-	})
+
 	config := map[string]interface{}{
-		"servers": servers,
-		"final":   mobileDispatcherDNSTag,
-	}
-	var rules []map[string]interface{}
-	for _, endpointTag := range tailscaleTags {
-		rules = append(rules, buildTailnetDNSRules(mobileTailscaleDNSTag(endpointTag))...)
+		"servers":           servers,
+		"final":             defaultResolverTag,
+		"independent_cache": true,
 	}
 	if len(rules) > 0 {
 		config["rules"] = rules
 	}
-	return config
+	return config, nil
 }
 
 func buildTransparentProxyDNS(
