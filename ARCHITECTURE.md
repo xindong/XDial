@@ -58,7 +58,8 @@ TUN、系统代理、系统 DNS、默认路由或持久状态；不启动未连�
 macOS 主入口为 `NETransparentProxyProvider`，以随机凭据保护的回环 SOCKS 将 TCP/UDP
 flow 交给同进程 sing-box。iOS / tvOS 使用 Packet Tunnel；系统 HTTP/SOCKS 代理与 PAC 不是当前入口。
 Transparent Proxy 不接管 ICMP。link-local、multicast、limited broadcast 留在 Underlay；
-RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品扩展。
+RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品硬编码扩展。
+Go 控制面在编译活动 Scenario 时，仅把按规则顺序确定先命中 Direct（或 `route.final = direct`）、且前面没有任何非 Direct 域名 / IP / 应用归因 / MagicDNS / 不透明规则可拦截的私网段（并扣除 `system_dns` 主机地址）下发给 Provider 写入 `excludedNetworkRules`（Tailnet、企业 VPN/代理私网段与 `system_dns` 始终留在盒内）。场景切换时，收紧排除在候选提交前生效，新增排除在候选不可逆提交后才下发，避免未提交候选提前放行连接。受 macOS `NETransparentProxyNetworkSettings` / `NENetworkRule` 平台约束，地址规则不支持端口区间或「排除非 53 端口」且禁止指定 `port: 53`，而在 `handleNewUDPFlow` 返回 `false` 会按首包永久放行整条无连接 UDP socket（导致后续公网/VPN 流量绕过代理，或首包公网时后续局域网 UDP 仍滞留回环改写源端口）；因此 `system_dns` 保持全量 `hijack-dns`，而应用绕过系统解析器直接发往非 `system_dns` 私有地址的原始 `:53` 查询随该已排除直连局域网段直接出站。
 
 Underlay 来自宿主请求连接前同一时刻的内核默认接口、完整 `NWPath.availableInterfaces`
 与系统 DNS；同一样本另取默认接口的 IPv4 地址与主服务 IPv4 / IPv6 默认路由器，只用于比较。

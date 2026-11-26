@@ -128,6 +128,11 @@ type transparentProxySession struct {
 	// lets the Provider pick the matching native SOCKS user without reproducing
 	// Go's derivation.
 	ApplicationProcessCredentials []config.ApplicationSOCKSCredential `json:"application_process_credentials,omitempty"`
+	// DirectExcludedNetworks is the Scenario-compiled, bounded set of private/LAN
+	// CIDRs that are deterministically routed to Direct and do not overlap any
+	// non-Direct rule or system DNS server, so macOS may exclude them from
+	// NETransparentProxyProvider and route them directly on the Underlay.
+	DirectExcludedNetworks []config.TransparentProxyRemoteNetwork `json:"direct_excluded_networks,omitempty"`
 	// LineOutbounds is a capability map for this exact active ConnectionPlan.
 	// It contains no endpoint or credential material and intentionally excludes
 	// enabled Lines that the active Scenario did not reference.
@@ -706,11 +711,22 @@ func generateTransparentProxySession(
 	if err != nil {
 		return "", err
 	}
+	ruleSetIPInfo := collectTransparentProxyRuleSetIPInfo(profile, data)
+	directExcludedNetworks, err := config.ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
+		profile,
+		systemDNS,
+		underlayLocalSubnetsResolver(underlayInterface),
+		ruleSetIPInfo,
+	)
+	if err != nil {
+		return "", err
+	}
 
 	session := transparentProxySession{
 		ConfigJSON:                    string(data),
 		Plan:                          plan,
 		ApplicationProcessCredentials: applicationProcessCredentials,
+		DirectExcludedNetworks:        directExcludedNetworks,
 	}
 	session.LineOutbounds, err = activeLineOutbounds(profile, plan)
 	if err != nil {
