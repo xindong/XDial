@@ -589,6 +589,72 @@ func TestComputeDirectExcludedNetworks_URLAndNativeAndSubscriptionRules(t *testi
 		t.Fatalf("native logical AND must not exclude addresses outside /24 intersection: %+v", gotAnd)
 	}
 
+	// Native default rule with BOTH domain_suffix and ip_cidr evaluates them with
+	// OR in sing-box: when bound to VPN, the domain alternative can match a
+	// corporate hostname resolving to 192.168.1.10, so later direct exclusions
+	// must be blocked completely.
+	mixedNativeVPNProfile := &Profile{
+		Lines: profile.Lines,
+		RuleSets: []RuleSet{
+			{
+				ID:         "mixed-corp",
+				Type:       RuleSetTypeNative,
+				Enabled:    true,
+				NativeRule: json.RawMessage(`{"domain_suffix":["corp.example"],"ip_cidr":["10.0.0.0/8"]}`),
+			},
+			{
+				ID:      "lan",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				CIDRs:   []string{"192.168.0.0/16"},
+			},
+		},
+		Scenarios: []Scenario{{
+			ID: "s",
+			Bindings: []RuleBinding{
+				{RuleSetID: "mixed-corp", LineID: "corp"},
+				{RuleSetID: "lan", LineID: "direct"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "s",
+	}
+	gotMixedNativeVPN, err := ComputeTransparentProxyDirectExcludedNetworks(mixedNativeVPNProfile, []string{"1.1.1.1"}, nil)
+	if err != nil {
+		t.Fatalf("mixed native VPN error: %v", err)
+	}
+	if len(gotMixedNativeVPN) != 0 {
+		t.Fatalf("mixed domain+ip_cidr native VPN rule must block later LAN exclusions, got %+v", gotMixedNativeVPN)
+	}
+
+	// Same OR semantics when bound to Direct: ip_cidr branch unconditionally
+	// matches 192.168.0.0/16 even when domain_suffix is also present.
+	mixedNativeDirectProfile := &Profile{
+		Lines: profile.Lines,
+		RuleSets: []RuleSet{{
+			ID:         "mixed-lan",
+			Type:       RuleSetTypeNative,
+			Enabled:    true,
+			NativeRule: json.RawMessage(`{"domain_suffix":["lan.example"],"ip_cidr":["192.168.0.0/16"]}`),
+		}},
+		Scenarios: []Scenario{{
+			ID:            "s",
+			Bindings:      []RuleBinding{{RuleSetID: "mixed-lan", LineID: "direct"}},
+			DefaultLineID: "corp",
+		}},
+		ActiveScenarioID: "s",
+	}
+	gotMixedNativeDirect, err := ComputeTransparentProxyDirectExcludedNetworks(mixedNativeDirectProfile, []string{"1.1.1.1"}, nil)
+	if err != nil {
+		t.Fatalf("mixed native Direct error: %v", err)
+	}
+	if !excludedContainsIP(t, gotMixedNativeDirect, "192.168.68.83") {
+		t.Fatalf("mixed domain+ip_cidr native Direct rule should exclude ip_cidr branch: %+v", gotMixedNativeDirect)
+	}
+	if excludedContainsIP(t, gotMixedNativeDirect, "10.0.0.5") {
+		t.Fatalf("mixed domain+ip_cidr native Direct rule must not exclude other ranges: %+v", gotMixedNativeDirect)
+	}
+
 	// Opaque URL rule set before direct rule fails closed.
 	gotOpaque, err := ComputeTransparentProxyDirectExcludedNetworksWithRuleSetInfo(
 		profile,

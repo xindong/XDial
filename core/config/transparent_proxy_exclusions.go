@@ -507,7 +507,8 @@ func classifyHeadlessRuleForExclusions(rule option.HeadlessRule, outerInvert boo
 
 		if inverted {
 			if hasDomain {
-				// !(domain) and !(domain && ip) both match any IP when domain does not match.
+				// !(domain || ip) matches when neither domain nor ip matches.
+				// We cannot guarantee direct for any IP, and conservatively block all.
 				return TransparentProxyRuleSetIPInfo{BlocksAll: true}
 			}
 			outside := subtractPrefixSets(privateLANUniverse, cidrs)
@@ -520,10 +521,13 @@ func classifyHeadlessRuleForExclusions(rule option.HeadlessRule, outerInvert boo
 			return TransparentProxyRuleSetIPInfo{BlocksAll: true}
 		}
 		if hasDomain && hasIP {
-			// Default rule ANDs domain and IP: can only match within cidrs when
-			// blocking, and cannot guarantee unconditional direct for literal IPs.
+			// In sing-box DefaultHeadlessRule, domain fields and ip_cidr share
+			// the destination-address group and are evaluated with OR:
+			//   - any IP in cidrs unconditionally matches (DirectCIDRs = cidrs)
+			//   - the domain alternative can match any IP (BlocksAll = true)
 			return TransparentProxyRuleSetIPInfo{
-				BlockCIDRs: cidrs,
+				DirectCIDRs: cidrs,
+				BlocksAll:   true,
 			}
 		}
 		return TransparentProxyRuleSetIPInfo{

@@ -44,6 +44,7 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	cnDomainURL := "https://rules.example/cn-domains.json"
 	cnIPURL := "https://rules.example/cn-ip.json"
 	corpURL := "https://rules.example/corp-ip.json"
+	corpMixedURL := "https://rules.example/corp-mixed.json"
 	directAndURL := "https://rules.example/direct-and.json"
 	directPortURL := "https://rules.example/direct-port.json"
 
@@ -57,6 +58,7 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	writeRuleCache("cn-domains", cnDomainURL, `{"version":2,"rules":[{"domain_suffix":["cn.example"]}]}`)
 	writeRuleCache("cn-ip", cnIPURL, `{"version":2,"rules":[{"ip_cidr":["114.114.114.0/24","223.5.5.0/24"]}]}`)
 	writeRuleCache("corp-ip", corpURL, `{"version":2,"rules":[{"ip_cidr":["172.27.0.0/16","192.168.99.0/24"]}]}`)
+	writeRuleCache("corp-mixed", corpMixedURL, `{"version":2,"rules":[{"domain_suffix":["corp.example"],"ip_cidr":["10.0.0.0/8"]}]}`)
 	writeRuleCache("direct-and", directAndURL, `{"version":2,"rules":[{"type":"logical","mode":"and","rules":[{"ip_cidr":["192.168.0.0/16"]},{"ip_cidr":["192.168.1.0/24"]}]}]}`)
 	writeRuleCache("direct-port", directPortURL, `{"version":2,"rules":[{"ip_cidr":["192.168.0.0/16"],"port":[443]}]}`)
 
@@ -81,6 +83,7 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 				{ID: "cn-domains", Name: "国内网站", Type: config.RuleSetTypeURL, Enabled: true, URL: cnDomainURL, Format: "json"},
 				{ID: "cn-ip", Name: "国内 IP", Type: config.RuleSetTypeURL, Enabled: true, URL: cnIPURL, Format: "json"},
 				{ID: "corp-ip", Name: "企业 URL IP", Type: config.RuleSetTypeURL, Enabled: true, URL: corpURL, Format: "json"},
+				{ID: "corp-mixed", Name: "企业混合规则", Type: config.RuleSetTypeURL, Enabled: true, URL: corpMixedURL, Format: "json"},
 				{ID: "direct-and", Name: "交集直连", Type: config.RuleSetTypeURL, Enabled: true, URL: directAndURL, Format: "json"},
 				{ID: "direct-port", Name: "端口直连", Type: config.RuleSetTypeURL, Enabled: true, URL: directPortURL, Format: "json"},
 			},
@@ -112,6 +115,15 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 						{RuleSetID: "lan", LineID: "direct"},
 					},
 					DefaultLineID: "company",
+				},
+				{
+					ID:   "corp-mixed-url-first",
+					Name: "企业混合优先",
+					Bindings: []config.RuleBinding{
+						{RuleSetID: "corp-mixed", LineID: "company"},
+						{RuleSetID: "lan", LineID: "direct"},
+					},
+					DefaultLineID: "direct",
 				},
 				{
 					ID:   "direct-and-only",
@@ -269,6 +281,28 @@ func TestGenerateTransparentProxySessionDirectExcludedNetworks(t *testing.T) {
 	}
 	if len(directPortSession.DirectExcludedNetworks) != 0 {
 		t.Fatalf("port-scoped Direct URL rule set must not exclude all ports, got %+v", directPortSession.DirectExcludedNetworks)
+	}
+
+	// 5.5. Materialized URL rule set with BOTH domain_suffix and ip_cidr bound to VPN
+	// evaluates them with OR in sing-box, so it must block all later LAN exclusions.
+	rawCorpMixed, err := GenerateTransparentProxySession(
+		makeProfile("corp-mixed-url-first"),
+		basePath,
+		29882,
+		"session-user",
+		"session-password",
+		"en0",
+		`["1.1.1.1"]`,
+	)
+	if err != nil {
+		t.Fatalf("corp-mixed-url-first GenerateTransparentProxySession: %v", err)
+	}
+	var corpMixedSession transparentProxySession
+	if err := json.Unmarshal([]byte(rawCorpMixed), &corpMixedSession); err != nil {
+		t.Fatal(err)
+	}
+	if len(corpMixedSession.DirectExcludedNetworks) != 0 {
+		t.Fatalf("mixed domain+ip_cidr VPN URL rule set must block later LAN exclusions, got %+v", corpMixedSession.DirectExcludedNetworks)
 	}
 
 	// 6. Scenario switch to all-vpn clears direct_excluded_networks completely.
