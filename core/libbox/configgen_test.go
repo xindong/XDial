@@ -100,11 +100,15 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 		servers[1].(map[string]interface{})["type"] != "tailscale" ||
 		servers[1].(map[string]interface{})["accept_default_resolvers"] != false ||
 		servers[1].(map[string]interface{})["accept_search_domain"] != true ||
-		servers[2].(map[string]interface{})["type"] != "xdial-mobile" {
+		servers[2].(map[string]interface{})["type"] != "https" ||
+		servers[2].(map[string]interface{})["detour"] != "tailscale-tailnet" {
 		t.Fatalf("NetworkExtension mobile DNS chain is incomplete: %v", servers)
 	}
-	if dns["final"] != "xdial-mobile-dns" {
-		t.Fatalf("NetworkExtension DNS final must use dispatcher: %v", dns)
+	if dns["final"] != "proxy-dns-tailscale-tailnet" {
+		t.Fatalf("NetworkExtension DNS final must follow default Line: %v", dns)
+	}
+	if dns["independent_cache"] != true {
+		t.Fatalf("NetworkExtension DNS must enable independent_cache: %v", dns)
 	}
 	rules, ok := dns["rules"].([]interface{})
 	if !ok || len(rules) != 2 {

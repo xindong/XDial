@@ -82,6 +82,7 @@ func dnsTransportRegistry() *dns.TransportRegistry {
 	registerTailscaleDNSTransport(registry)
 	registerPooledTailscaleDNS(registry)
 	registerMobileDNSTransport(registry)
+	registerMobileUnderlayDNSTransport(registry)
 	registerAnyConnectDNSTransport(registry)
 	return registry
 }

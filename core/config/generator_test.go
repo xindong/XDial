@@ -1138,7 +1138,7 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	}
 	servers := cfg.DNS["servers"].([]interface{})
 	if len(servers) != 3 {
-		t.Fatalf("expected public, Tailscale, and dispatcher DNS servers, got %v", servers)
+		t.Fatalf("expected public, Tailscale, and default Line DNS servers, got %v", servers)
 	}
 	publicDNS := servers[0].(map[string]interface{})
 	if publicDNS["type"] != "udp" || publicDNS["tag"] != mobilePublicDNSTag ||
@@ -1155,20 +1155,18 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 		tailscaleDNS["accept_search_domain"] != true {
 		t.Fatalf("unexpected Tailscale DNS transport: %v", tailscaleDNS)
 	}
-	dispatcher := servers[2].(map[string]interface{})
-	if dispatcher["type"] != "xdial-mobile" ||
-		dispatcher["tag"] != mobileDispatcherDNSTag ||
-		dispatcher["public_fallback"] != mobilePublicDNSTag {
-		t.Fatalf("unexpected mobile DNS dispatcher: %v", dispatcher)
+	defaultLineDNS := servers[2].(map[string]interface{})
+	wantDefaultTag := desktopProxyDNSTag("tailscale-mobile-tailnet")
+	if defaultLineDNS["type"] != "https" ||
+		defaultLineDNS["tag"] != wantDefaultTag ||
+		defaultLineDNS["detour"] != "tailscale-mobile-tailnet" {
+		t.Fatalf("unexpected default Line DNS transport: %v", defaultLineDNS)
 	}
-	bindings := dispatcher["tailscale"].([]interface{})
-	if len(bindings) != 1 ||
-		bindings[0].(map[string]interface{})["endpoint"] != "tailscale-mobile-tailnet" ||
-		bindings[0].(map[string]interface{})["server"] != mobileTailscaleDNSTag("tailscale-mobile-tailnet") {
-		t.Fatalf("unexpected dispatcher bindings: %v", bindings)
+	if cfg.DNS["final"] != wantDefaultTag {
+		t.Fatalf("mobile DNS final must follow default Line: %v", cfg.DNS)
 	}
-	if cfg.DNS["final"] != mobileDispatcherDNSTag {
-		t.Fatalf("mobile DNS final must use dispatcher: %v", cfg.DNS)
+	if cfg.DNS["independent_cache"] != true {
+		t.Fatalf("mobile DNS must enable independent_cache: %v", cfg.DNS)
 	}
 	routeRules := cfg.Route["rules"].([]interface{})
 	if len(routeRules) < 2 ||
@@ -1244,19 +1242,19 @@ func TestTailscaleLineWithoutMagicDNSToggleHasNoMagicDNSSideEffects(t *testing.T
 // 多 endpoint 的 DNS 绑定不能串台。生成器层面现在只会给出一个 endpoint
 // （见 TestGenerateRejectsMultipleEnabledTailscaleLines），所以直接测 buildNEDNS。
 func TestBuildNEDNSKeepsTailscaleBindingsIsolated(t *testing.T) {
-	dns := buildNEDNS([]string{"tailscale-tail-a", "tailscale-tail-b"})
+	dns, err := buildNEDNS(nil, nil, nil, nil, nil, []string{"tailscale-tail-a", "tailscale-tail-b"}, "direct", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	servers := dns["servers"].([]map[string]interface{})
 	if len(servers) != 4 {
-		t.Fatalf("expected public + two Tailscale + dispatcher servers, got %v", servers)
-	}
-	dispatcher := servers[len(servers)-1]
-	bindings := dispatcher["tailscale"].([]map[string]interface{})
-	if len(bindings) != 2 {
-		t.Fatalf("每个 endpoint 都要有自己的 DNS transport: %v", bindings)
+		t.Fatalf("expected public + two Tailscale + underlay direct servers, got %v", servers)
 	}
 	seen := make(map[string]string)
-	for _, binding := range bindings {
-		seen[binding["endpoint"].(string)] = binding["server"].(string)
+	for _, server := range servers {
+		if server["type"] == "tailscale" {
+			seen[server["endpoint"].(string)] = server["tag"].(string)
+		}
 	}
 	if seen["tailscale-tail-a"] != mobileTailscaleDNSTag("tailscale-tail-a") ||
 		seen["tailscale-tail-b"] != mobileTailscaleDNSTag("tailscale-tail-b") {
@@ -1296,7 +1294,7 @@ func TestGenerateNERejectsMultipleActiveTailscaleLines(t *testing.T) {
 	}
 }
 
-func TestGenerateNEWithoutTailscaleStillUsesMobileDNSDispatcher(t *testing.T) {
+func TestGenerateNEStandaloneDirectUsesUnderlayDNS(t *testing.T) {
 	p := &Profile{
 		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
 		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
@@ -1313,11 +1311,201 @@ func TestGenerateNEWithoutTailscaleStillUsesMobileDNSDispatcher(t *testing.T) {
 	servers := cfg.DNS["servers"].([]interface{})
 	if len(servers) != 2 ||
 		servers[0].(map[string]interface{})["tag"] != mobilePublicDNSTag ||
-		servers[1].(map[string]interface{})["type"] != "xdial-mobile" {
-		t.Fatalf("standalone NE DNS dispatcher is incomplete: %v", servers)
+		servers[1].(map[string]interface{})["type"] != "xdial-underlay" ||
+		servers[1].(map[string]interface{})["tag"] != mobileDirectDNSTag ||
+		servers[1].(map[string]interface{})["fallback"] != mobilePublicDNSTag {
+		t.Fatalf("standalone NE direct DNS chain is incomplete: %v", servers)
 	}
-	if bindings := servers[1].(map[string]interface{})["tailscale"].([]interface{}); len(bindings) != 0 {
-		t.Fatalf("standalone dispatcher unexpectedly contains Tailscale: %v", bindings)
+	if cfg.DNS["final"] != mobileDirectDNSTag {
+		t.Fatalf("standalone NE direct DNS final = %v, want %s", cfg.DNS["final"], mobileDirectDNSTag)
+	}
+	if cfg.DNS["independent_cache"] != true {
+		t.Fatalf("NE DNS must enable independent_cache: %v", cfg.DNS)
+	}
+}
+
+func TestGenerateNEScenarioSplitsDirectAndAnyConnectDNSWithIPv4OnlyVPN(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "office-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com:8443"},
+		},
+		RuleSets: []RuleSet{
+			{
+				ID:      "intranet",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				Domains: []string{"corp.example.com"},
+				CIDRs:   []string{"10.0.0.0/8"},
+			},
+			{
+				ID:      "local-net",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				CIDRs:   []string{"192.168.0.0/16"},
+			},
+			{
+				ID:               "cn-domains",
+				Type:             RuleSetTypeURL,
+				Enabled:          true,
+				URL:              "https://rules.example/geosite-cn.srs",
+				Format:           "binary",
+				RuntimeMatchKind: RuleSetMatchDomain,
+			},
+			{
+				ID:               "cn-ips",
+				Type:             RuleSetTypeURL,
+				Enabled:          true,
+				URL:              "https://rules.example/geoip-cn.srs",
+				Format:           "binary",
+				RuntimeMatchKind: RuleSetMatchIP,
+			},
+		},
+		Scenarios: []Scenario{{
+			ID: "cn",
+			Bindings: []RuleBinding{
+				{RuleSetID: "intranet", LineID: "office-vpn"},
+				{RuleSetID: "local-net", LineID: "direct"},
+				{RuleSetID: "cn-domains", LineID: "direct"},
+				{RuleSetID: "cn-ips", LineID: "direct"},
+			},
+			DefaultLineID: "office-vpn",
+		}},
+		ActiveScenarioID: "cn",
+	}
+
+	// Apple NE (systemDNS == nil): Direct uses xdial-underlay; VPN uses xdial-anyconnect + ipv4_only.
+	appleRaw, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var appleCfg SingBoxConfig
+	if err := json.Unmarshal(appleRaw, &appleCfg); err != nil {
+		t.Fatal(err)
+	}
+	if appleCfg.DNS["final"] != transparentEnterpriseDNSTag {
+		t.Fatalf("Apple NE default VPN final = %v, want %s", appleCfg.DNS["final"], transparentEnterpriseDNSTag)
+	}
+	if appleCfg.DNS["independent_cache"] != true {
+		t.Fatalf("Apple NE DNS must enable independent_cache")
+	}
+	appleRules := appleCfg.DNS["rules"].([]interface{})
+	if len(appleRules) != 3 {
+		t.Fatalf("expected intranet + cn-domains + default ipv4_only rules, got %v", appleRules)
+	}
+	r0 := appleRules[0].(map[string]interface{})
+	if r0["server"] != transparentEnterpriseDNSTag || r0["strategy"] != "ipv4_only" {
+		t.Fatalf("intranet DNS rule must use enterprise DNS with ipv4_only: %v", r0)
+	}
+	r1 := appleRules[1].(map[string]interface{})
+	if r1["rule_set"] != "ruleset-cn-domains" || r1["server"] != mobileDirectDNSTag {
+		t.Fatalf("cn-domains DNS rule must use direct underlay DNS: %v", r1)
+	}
+	if _, hasStrategy := r1["strategy"]; hasStrategy {
+		t.Fatalf("direct DNS rule must not force ipv4_only: %v", r1)
+	}
+	r2 := appleRules[2].(map[string]interface{})
+	if r2["server"] != transparentEnterpriseDNSTag || r2["strategy"] != "ipv4_only" {
+		t.Fatalf("default VPN catch-all DNS rule must force ipv4_only: %v", r2)
+	}
+
+	// Android NE (systemDNS != nil): Direct uses captured system DNS in mobilePublicDNSTag.
+	androidRaw, err := GenerateSingBoxAndroid(p, t.TempDir(), []string{"202.96.209.133"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var androidCfg SingBoxConfig
+	if err := json.Unmarshal(androidRaw, &androidCfg); err != nil {
+		t.Fatal(err)
+	}
+	androidRules := androidCfg.DNS["rules"].([]interface{})
+	if len(androidRules) != 3 {
+		t.Fatalf("expected 3 Android DNS rules, got %v", androidRules)
+	}
+	if androidRules[1].(map[string]interface{})["server"] != mobilePublicDNSTag {
+		t.Fatalf("Android direct DNS rule must use captured Underlay DNS %s: %v", mobilePublicDNSTag, androidRules[1])
+	}
+	for _, rawServer := range androidCfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == mobilePublicDNSTag && server["server"] != "202.96.209.133" {
+			t.Fatalf("Android Underlay DNS server not updated: %v", server)
+		}
+		if server["tag"] == mobileDirectDNSTag {
+			t.Fatalf("Android must not register Darwin underlay transport: %v", server)
+		}
+	}
+}
+
+func TestGenerateNEProxyBindingUsesProxyDoHAndPreservesOrder(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID: "hk", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "hk.example.com", TrojanPort: 443, TrojanPassword: "secret", TrojanSNI: "hk.example.com",
+			},
+		},
+		RuleSets: []RuleSet{
+			{
+				ID:      "force-proxy",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				Domains: []string{"blocked.example"},
+			},
+			{
+				ID:               "cn-domains",
+				Type:             RuleSetTypeURL,
+				Enabled:          true,
+				URL:              "https://rules.example/geosite-cn.srs",
+				Format:           "binary",
+				RuntimeMatchKind: RuleSetMatchDomain,
+			},
+		},
+		Scenarios: []Scenario{{
+			ID: "daily",
+			Bindings: []RuleBinding{
+				{RuleSetID: "force-proxy", LineID: "hk"},
+				{RuleSetID: "cn-domains", LineID: "direct"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "daily",
+	}
+
+	raw, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DNS["final"] != mobileDirectDNSTag {
+		t.Fatalf("default direct final = %v, want %s", cfg.DNS["final"], mobileDirectDNSTag)
+	}
+	rules := cfg.DNS["rules"].([]interface{})
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 DNS rules, got %v", rules)
+	}
+	wantProxyDNS := desktopProxyDNSTag("proxy-hk")
+	if rules[0].(map[string]interface{})["server"] != wantProxyDNS {
+		t.Fatalf("first DNS rule must bind to proxy DoH %s: %v", wantProxyDNS, rules[0])
+	}
+	if rules[1].(map[string]interface{})["server"] != mobileDirectDNSTag {
+		t.Fatalf("second DNS rule must bind to direct underlay DNS: %v", rules[1])
+	}
+	var foundProxyDoH bool
+	for _, rawServer := range cfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == wantProxyDNS {
+			foundProxyDoH = true
+			if server["type"] != "https" || server["server"] != "1.1.1.1" || server["detour"] != "proxy-hk" {
+				t.Fatalf("unexpected proxy DoH server: %v", server)
+			}
+		}
+	}
+	if !foundProxyDoH {
+		t.Fatalf("proxy DoH server %s missing: %v", wantProxyDNS, cfg.DNS["servers"])
 	}
 }
 
