@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -498,5 +499,122 @@ func TestTransparentSOCKSUDPDirectSharedPortAcrossDomainAndLiteral(t *testing.T)
 
 	if observedDomain.String() != observedLiteral.String() {
 		t.Fatalf("domain and literal direct targets used different source ports: %s vs %s", observedDomain, observedLiteral)
+	}
+}
+
+// Verify IPv6 multi-destination shared-port mapping, cross-family isolation
+// between IPv4 and IPv6 sockets on the same association, and IPv4-mapped IPv6
+// normalization onto the IPv4 shared socket.
+func TestTransparentSOCKSUDPDirectDualStackAndIPv6Mapping(t *testing.T) {
+	newEcho := func(network string, ip net.IP, label byte) (M.Socksaddr, chan net.Addr, error) {
+		conn, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
+		if err != nil {
+			return M.Socksaddr{}, nil, err
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		seen := make(chan net.Addr, 8)
+		go func() {
+			var data [2048]byte
+			for {
+				n, from, readErr := conn.ReadFromUDP(data[:])
+				if readErr != nil {
+					return
+				}
+				seen <- from
+				reply := append([]byte{label, ':'}, data[:n]...)
+				_, _ = conn.WriteToUDP(reply, from)
+			}
+		}()
+		return M.SocksaddrFromNet(conn.LocalAddr()), seen, nil
+	}
+
+	v6A, seenV6A, err := newEcho("udp6", net.IPv6loopback, '1')
+	if err != nil {
+		t.Skipf("IPv6 loopback UDP unavailable: %v", err)
+	}
+	v6B, seenV6B, err := newEcho("udp6", net.IPv6loopback, '2')
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4A, seenV4A, err := newEcho("udp4", net.IPv4(127, 0, 0, 1), '4')
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	port := freeFlowCorrectionPort(t)
+	rt := newLoopbackFlowRuntimeWithConfig(t, fmt.Sprintf(`{
+		"log":{"disabled":true},
+		"inbounds":[{"type":"socks","tag":"flow","listen":"127.0.0.1","listen_port":%d,"xdial_flow_metadata":true}],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{"final":"direct"}
+	}`, port))
+	defer rt.Stop()
+
+	client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), socks.Version5, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+
+	conn, err := client.ListenPacket(ctx, v6A)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	packetConn, ok := conn.(N.PacketConn)
+	if !ok {
+		t.Fatalf("socks ListenPacket returned %T, want N.PacketConn", conn)
+	}
+
+	roundTrip := func(target M.Socksaddr, wantSource M.Socksaddr, payload, wantReply string) {
+		t.Helper()
+		pkt := buf.NewPacket()
+		pkt.Resize(N.CalculateFrontHeadroom(packetConn), 0)
+		_, _ = pkt.WriteString(payload)
+		if err := packetConn.WritePacket(pkt, target); err != nil {
+			t.Fatalf("send %q to %s: %v", payload, target, err)
+		}
+		reply := buf.NewPacket()
+		defer reply.Release()
+		from, err := packetConn.ReadPacket(reply)
+		if err != nil {
+			t.Fatalf("read reply from %s: %v", target, err)
+		}
+		if from.Unwrap() != wantSource.Unwrap() || string(reply.Bytes()) != wantReply {
+			t.Fatalf("reply for %s: got %q from %s, want %q from %s", target, string(reply.Bytes()), from, wantReply, wantSource)
+		}
+	}
+
+	// Two IPv6 direct destinations share one IPv6 outbound UDP port.
+	roundTrip(v6A, v6A, "v6-a", "1:v6-a")
+	fromV6A := <-seenV6A
+	roundTrip(v6B, v6B, "v6-b", "2:v6-b")
+	fromV6B := <-seenV6B
+	if fromV6A.String() != fromV6B.String() {
+		t.Fatalf("IPv6 direct targets used different source ports: %s vs %s", fromV6A, fromV6B)
+	}
+
+	// IPv4 and IPv4-mapped IPv6 destinations on the same association share one
+	// IPv4 socket, isolated from the IPv6 socket.
+	roundTrip(v4A, v4A, "v4-plain", "4:v4-plain")
+	fromV4Plain := <-seenV4A
+	if fromV4Plain.String() == fromV6A.String() {
+		t.Fatalf("IPv4 target unexpectedly shared IPv6 socket %s", fromV6A)
+	}
+
+	mappedV4 := M.SocksaddrFrom(netip.MustParseAddr("::ffff:127.0.0.1"), v4A.Port)
+	roundTrip(mappedV4, v4A, "v4-mapped", "4:v4-mapped")
+	fromV4Mapped := <-seenV4A
+	if fromV4Mapped.String() != fromV4Plain.String() {
+		t.Fatalf("IPv4-mapped target used different source port than plain IPv4: %s vs %s", fromV4Mapped, fromV4Plain)
+	}
+
+	// Alternated IPv6 traffic still reuses the original IPv6 source port.
+	roundTrip(v6A, v6A, "v6-a-2", "1:v6-a-2")
+	fromV6A2 := <-seenV6A
+	if fromV6A2.String() != fromV6A.String() {
+		t.Fatalf("IPv6 source port changed after IPv4 traffic: got %s, want %s", fromV6A2, fromV6A)
 	}
 }

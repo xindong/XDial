@@ -528,12 +528,13 @@
 +}
 --- /dev/null
 +++ b/protocol/socks/xdial_udp_pool_test.go
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,218 @@
 +package socks
 +
 +import (
 +	"context"
 +	"net"
++	"net/netip"
 +	"sync"
 +	"sync/atomic"
 +	"testing"
@@ -713,21 +714,36 @@
 +		require.Equal(t, sharedAddr, h.LocalAddr().String())
 +	}
 +
-+	// Different outbound tag or bound interface gets its own socket.
++	// Different outbound tag, bound interface, or IP address family gets its own socket.
 +	keyB := adapter.XDialDirectPacketSocketKey{Outbound: "direct-alt"}
 +	keyBound := adapter.XDialDirectPacketSocketKey{Outbound: "direct", BoundInterface: "en0"}
++	keyV6 := adapter.XDialDirectPacketSocketKey{Outbound: "direct", IPv6: true}
 +	hB, err := pool.Acquire(ctx, keyB, M.ParseSocksaddr("127.0.0.1:20001"), openSocket)
 +	require.NoError(t, err)
 +	hBound, err := pool.Acquire(ctx, keyBound, M.ParseSocksaddr("127.0.0.1:20002"), openSocket)
 +	require.NoError(t, err)
-+	require.Equal(t, int32(3), opens.Load())
++	hV6, err := pool.Acquire(ctx, keyV6, M.ParseSocksaddr("[::1]:20003"), openSocket)
++	require.NoError(t, err)
++	require.Equal(t, int32(4), opens.Load())
 +	require.NotEqual(t, sharedAddr, hB.LocalAddr().String())
 +	require.NotEqual(t, sharedAddr, hBound.LocalAddr().String())
++	require.NotEqual(t, sharedAddr, hV6.LocalAddr().String())
 +	require.NotEqual(t, hB.LocalAddr().String(), hBound.LocalAddr().String())
++	require.NotEqual(t, hB.LocalAddr().String(), hV6.LocalAddr().String())
++	require.NotEqual(t, hBound.LocalAddr().String(), hV6.LocalAddr().String())
++
++	// IPv4-mapped IPv6 peers normalize to the same IPv4 peer key as plain IPv4.
++	mappedPeer, ok := xdialDirectPeerKey(M.SocksaddrFrom(netip.MustParseAddr("::ffff:127.0.0.1"), 5000))
++	require.True(t, ok)
++	plainPeer, ok := xdialDirectPeerKey(M.SocksaddrFrom(netip.MustParseAddr("127.0.0.1"), 5000))
++	require.True(t, ok)
++	require.Equal(t, plainPeer, mappedPeer)
++	require.True(t, mappedPeer.Addr().Is4())
 +
 +	for _, h := range handles {
 +		require.NoError(t, h.Close())
 +	}
 +	require.NoError(t, hB.Close())
 +	require.NoError(t, hBound.Close())
++	require.NoError(t, hV6.Close())
 +}
