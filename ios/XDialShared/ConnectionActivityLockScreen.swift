@@ -105,7 +105,7 @@ struct XDialSpeedLabel: View {
             Text(compact ? XDialSpeedFormat.short(value) : XDialSpeedFormat.full(value))
                 .font(.system(.footnote, design: .rounded).monospacedDigit())
                 .lineLimit(1)
-                .contentTransition(.numericText())
+                .contentTransition(.identity)
         }
         .fixedSize()
     }

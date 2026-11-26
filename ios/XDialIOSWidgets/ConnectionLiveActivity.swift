@@ -141,7 +141,7 @@ private struct CompactSpeed: View {
             Text(XDialSpeedFormat.widestShort).font(font).hidden()
             Text(XDialSpeedFormat.short(value))
                 .font(font)
-                .contentTransition(.numericText())
+                .contentTransition(.identity)
         }
         .lineLimit(1)
     }
