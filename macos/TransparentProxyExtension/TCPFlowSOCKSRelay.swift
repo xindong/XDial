@@ -350,7 +350,7 @@ enum TCPFlowSOCKSRelay {
         }
     }
 
-    private static func authenticate(
+    static func authenticate(
         _ credentials: SOCKSCredentials,
         connection: some SOCKSRelayStream
     ) async throws {

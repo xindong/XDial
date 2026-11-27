@@ -3,8 +3,8 @@ import Network
 
 /// 本机 SOCKS5 共享：其他本机程序经 `127.0.0.1:<port>` 使用当前已提交的场景。
 ///
-/// 端口由 Provider 持有，只绑回环，只接受无认证的 TCP CONNECT。每条连接在
-/// 接入时取得当前 generation 的会话入口，场景切换不改动监听端口；应用身份
+/// 端口由 Provider 持有，只绑回环，只接受无认证的 TCP CONNECT 与 UDP ASSOCIATE。
+/// 每条连接在接入时取得当前 generation 的会话入口，场景切换不改动监听端口；应用身份
 /// 不经过这条入口，因此只走场景的普通规则。
 enum LocalSOCKSSharePort {
     static let defaultValue = 5181
@@ -131,10 +131,10 @@ enum LocalSOCKSSharePolicy {
     }
 }
 
-/// 面向客户端的 SOCKS5 握手。只解析到目标为止；之后由会话入口完成 CONNECT。
+/// 面向客户端的 SOCKS5 握手与 UDP 报头校验。
 ///
-/// 会话入口接受 Provider 的 flow metadata（以 NUL 开头的域名信封），这里必须
-/// 只放行普通主机名，客户端不能借本机端口伪造接口绑定或原始地址。
+/// 会话入口接受 Provider 的 flow metadata（以 NUL 开头的域名信封），这里在握手与
+/// 每个 UDP 数据报上都只放行普通主机名，客户端不能借本机端口伪造接口绑定或原始地址。
 enum LocalSOCKSHandshake {
     enum Failure: Error, Equatable {
         case invalidVersion
@@ -163,6 +163,12 @@ enum LocalSOCKSHandshake {
         let port: UInt16
     }
 
+    enum Request: Equatable {
+        case connect(Destination)
+        /// `clientPort` 仅在客户端显式声明本机回环非零源端口时填入（RFC 1928 §6）。
+        case udpAssociate(clientPort: UInt16?)
+    }
+
     typealias Read = (Int) async throws -> Data
 
     static let acceptNoAuthentication = Data([0x05, 0x00])
@@ -181,27 +187,33 @@ enum LocalSOCKSHandshake {
         guard methods.contains(0x00) else { throw Failure.noAcceptableMethod }
     }
 
-    static func readRequest(_ read: Read) async throws -> Destination {
+    static func readRequest(_ read: Read) async throws -> Request {
         let header = try await read(4)
         let base = header.startIndex
         guard header[base] == 0x05, header[base + 2] == 0x00 else {
             throw Failure.invalidVersion
         }
-        guard header[base + 1] == 0x01 else {
+        let command = header[base + 1]
+        guard command == 0x01 || command == 0x03 else {
             throw Failure.commandNotSupported
         }
         let host: String
+        let isLoopbackHint: Bool
         switch header[base + 3] {
         case 0x01:
             guard let address = IPv4Address(try await read(4)) else {
                 throw Failure.invalidDestination
             }
             host = "\(address)"
+            isLoopbackHint = address == .loopback
         case 0x04:
             guard let address = IPv6Address(try await read(16)) else {
                 throw Failure.invalidDestination
             }
             host = "\(address)"
+            // 中继套接字固定绑定 IPv4 127.0.0.1，客户端若原持 IPv6 套接字在收到
+            // IPv4 BND.ADDR 后可能另开 IPv4 临时端口发包，仅对 127.0.0.1 预锁端口。
+            isLoopbackHint = false
         case 0x03:
             let length = try await read(1)
             let count = Int(length[length.startIndex])
@@ -210,14 +222,19 @@ enum LocalSOCKSHandshake {
                 throw Failure.invalidDestination
             }
             host = name
+            isLoopbackHint = false
         default:
             throw Failure.addressTypeNotSupported
         }
         let portBytes = try await read(2)
         let port = UInt16(portBytes[portBytes.startIndex]) << 8
             | UInt16(portBytes[portBytes.startIndex + 1])
-        guard port != 0 else { throw Failure.invalidDestination }
-        return Destination(host: host, port: port)
+        if command == 0x01 {
+            guard port != 0 else { throw Failure.invalidDestination }
+            return .connect(Destination(host: host, port: port))
+        }
+        let hintedPort = (isLoopbackHint && port != 0) ? port : nil
+        return .udpAssociate(clientPort: hintedPort)
     }
 
     /// 只放行可打印的主机名字节；NUL、空白与控制字符一律拒绝。
@@ -232,9 +249,73 @@ enum LocalSOCKSHandshake {
         return name
     }
 
-    /// 回给客户端的 CONNECT 结果。绑定地址指向本机会话入口，对客户端没有意义，
+    /// 校验客户端发来的 SOCKS5 UDP 请求包（RFC 1928 §7），返回数据载荷字节数。
+    ///
+    /// 拒绝分片包、端口 0 与含控制字符的域名，防止客户端经 UDP 帧头注入
+    /// Provider 专用的 flow metadata 或绑定接口标记包。
+    static func clientUDPDatagramPayloadLength(_ packet: Data) -> Int? {
+        udpDatagramPayloadLength(packet, requireNonZeroPort: true)
+    }
+
+    /// 校验会话入口回传的 SOCKS5 UDP 响应包，返回数据载荷字节数。
+    static func serverUDPDatagramPayloadLength(_ packet: Data) -> Int? {
+        udpDatagramPayloadLength(packet, requireNonZeroPort: false)
+    }
+
+    private static func udpDatagramPayloadLength(
+        _ packet: Data,
+        requireNonZeroPort: Bool
+    ) -> Int? {
+        guard packet.count >= 7 else { return nil }
+        let base = packet.startIndex
+        guard
+            packet[base] == 0x00,
+            packet[base + 1] == 0x00,
+            packet[base + 2] == 0x00
+        else {
+            return nil
+        }
+        let portOffset: Int
+        switch packet[base + 3] {
+        case 0x01:
+            portOffset = 4 + 4
+        case 0x04:
+            portOffset = 4 + 16
+        case 0x03:
+            guard packet.count > 4 else { return nil }
+            let length = Int(packet[base + 4])
+            guard
+                length > 0,
+                packet.count >= 5 + length + 2,
+                hostname(packet.subdata(in: (base + 5)..<(base + 5 + length))) != nil
+            else {
+                return nil
+            }
+            portOffset = 5 + length
+        default:
+            return nil
+        }
+        guard packet.count >= portOffset + 2 else { return nil }
+        let port = UInt16(packet[base + portOffset]) << 8
+            | UInt16(packet[base + portOffset + 1])
+        if requireNonZeroPort, port == 0 {
+            return nil
+        }
+        return packet.count - (portOffset + 2)
+    }
+
+    /// 回给客户端的 CONNECT 或错误结果。绑定地址指向本机会话入口，对客户端没有意义，
     /// 统一填 0.0.0.0:0。
     static func reply(_ code: UInt8) -> Data {
         Data([0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+    }
+
+    /// 回给客户端的 UDP ASSOCIATE 成功结果，指向本机回环 UDP 中继端口。
+    static func udpAssociateReply(port: UInt16) -> Data {
+        Data([
+            0x05, 0x00, 0x00, 0x01,
+            127, 0, 0, 1,
+            UInt8(port >> 8), UInt8(port & 0xFF),
+        ])
     }
 }

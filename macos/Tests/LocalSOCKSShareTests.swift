@@ -33,21 +33,57 @@ final class LocalSOCKSShareTests: XCTestCase {
         let ipv4 = try await LocalSOCKSHandshake.readRequest(
             reader([0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
         )
-        XCTAssertEqual(ipv4, .init(host: "1.2.3.4", port: 443))
+        XCTAssertEqual(ipv4, .connect(.init(host: "1.2.3.4", port: 443)))
 
         var ipv6Bytes: [UInt8] = [0x05, 0x01, 0x00, 0x04]
         ipv6Bytes += [0x20, 0x01, 0x0d, 0xb8] + Array(repeating: 0, count: 11) + [1]
         ipv6Bytes += [0x00, 0x50]
         let ipv6 = try await LocalSOCKSHandshake.readRequest(reader(ipv6Bytes))
-        XCTAssertEqual(ipv6.port, 80)
+        guard case let .connect(ipv6Dest) = ipv6 else {
+            return XCTFail("expected connect request")
+        }
+        XCTAssertEqual(ipv6Dest.port, 80)
         // The upstream negotiation re-encodes literal hosts as IPv6.
-        XCTAssertEqual(IPv6Address(ipv6.host), IPv6Address("2001:db8::1"))
+        XCTAssertEqual(IPv6Address(ipv6Dest.host), IPv6Address("2001:db8::1"))
 
         let name = Array("example.com".utf8)
         let domain = try await LocalSOCKSHandshake.readRequest(
             reader([0x05, 0x01, 0x00, 0x03, UInt8(name.count)] + name + [0x1F, 0x90])
         )
-        XCTAssertEqual(domain, .init(host: "example.com", port: 8080))
+        XCTAssertEqual(domain, .connect(.init(host: "example.com", port: 8080)))
+    }
+
+    func testUDPAssociateRequestForms() async throws {
+        let unspecifiedIPv4 = try await LocalSOCKSHandshake.readRequest(
+            reader([0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        )
+        XCTAssertEqual(unspecifiedIPv4, .udpAssociate(clientPort: nil))
+
+        let hintedIPv4 = try await LocalSOCKSHandshake.readRequest(
+            reader([0x05, 0x03, 0x00, 0x01, 127, 0, 0, 1, 0xCE, 0xCC])
+        )
+        XCTAssertEqual(hintedIPv4, .udpAssociate(clientPort: 52940))
+
+        let nonLoopbackHint = try await LocalSOCKSHandshake.readRequest(
+            reader([0x05, 0x03, 0x00, 0x01, 8, 8, 8, 8, 0x00, 0x35])
+        )
+        XCTAssertEqual(nonLoopbackHint, .udpAssociate(clientPort: nil))
+
+        let unspecifiedIPv6 = try await LocalSOCKSHandshake.readRequest(
+            reader([0x05, 0x03, 0x00, 0x04] + Array(repeating: 0, count: 18))
+        )
+        XCTAssertEqual(unspecifiedIPv6, .udpAssociate(clientPort: nil))
+
+        let host = Array("localhost".utf8)
+        let domainHint = try await LocalSOCKSHandshake.readRequest(
+            reader([0x05, 0x03, 0x00, 0x03, UInt8(host.count)] + host + [0x14, 0x3D])
+        )
+        XCTAssertEqual(domainHint, .udpAssociate(clientPort: nil))
+
+        XCTAssertEqual(
+            LocalSOCKSHandshake.udpAssociateReply(port: 51820),
+            Data([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0xCA, 0x6C])
+        )
     }
 
     func testClientCannotForgeProviderFlowMetadata() async {
@@ -57,6 +93,10 @@ final class LocalSOCKSShareTests: XCTestCase {
             [0x05, 0x01, 0x00, 0x03, UInt8(envelope.count)] + envelope + [0x00, 0x50],
             fails: .invalidDestination
         )
+        await assertRequest(
+            [0x05, 0x03, 0x00, 0x03, UInt8(envelope.count)] + envelope + [0x00, 0x00],
+            fails: .invalidDestination
+        )
         let spaced = Array("a b".utf8)
         await assertRequest(
             [0x05, 0x01, 0x00, 0x03, UInt8(spaced.count)] + spaced + [0x00, 0x50],
@@ -64,10 +104,51 @@ final class LocalSOCKSShareTests: XCTestCase {
         )
     }
 
-    func testOnlyTCPConnectIsSupported() async {
-        await assertRequest([0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0], fails: .commandNotSupported)
+    func testClientUDPDatagramValidationBlocksForgedMetadataAndFragments() throws {
+        let ipv4Packet = Data([0x00, 0x00, 0x00, 0x01, 172, 24, 4, 79, 0x00, 0x35, 1, 2, 3, 4])
+        XCTAssertEqual(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(ipv4Packet), 4)
+
+        let prefixed = Data([0xFF, 0xEE]) + ipv4Packet
+        let slice = prefixed.dropFirst(2)
+        XCTAssertEqual(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(slice), 4)
+
+        let domain = Array("internal.example.com".utf8)
+        let domainPacket = Data([0x00, 0x00, 0x00, 0x03, UInt8(domain.count)] + domain + [0x01, 0xBB, 0x42])
+        XCTAssertEqual(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(domainPacket), 1)
+
+        var ipv6Packet = Data([0x00, 0x00, 0x00, 0x04])
+        ipv6Packet.append(contentsOf: Array(repeating: 0, count: 15) + [1])
+        ipv6Packet.append(contentsOf: [0x01, 0xBB])
+        XCTAssertEqual(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(ipv6Packet), 0)
+
+        let marker = try XCTUnwrap(
+            TransparentProxyFlowMetadata.boundAssociationMarkerDatagram(boundInterface: "en0")
+        )
+        XCTAssertNil(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(marker))
+
+        let addressEnvelope = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encode(
+                hostname: "example.com",
+                endpointHost: .ipv4(IPv4Address("1.2.3.4")!)
+            )
+        )
+        let forgedDatagram = Data([0x00, 0x00, 0x00, 0x03, UInt8(addressEnvelope.count)])
+            + addressEnvelope + Data([0x01, 0xBB, 0xAA])
+        XCTAssertNil(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(forgedDatagram))
+
+        let fragmented = Data([0x00, 0x00, 0x01, 0x01, 1, 2, 3, 4, 0x00, 0x35, 0xAA])
+        XCTAssertNil(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(fragmented))
+
+        let zeroPort = Data([0x00, 0x00, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x00, 0xAA])
+        XCTAssertNil(LocalSOCKSHandshake.clientUDPDatagramPayloadLength(zeroPort))
+        XCTAssertEqual(LocalSOCKSHandshake.serverUDPDatagramPayloadLength(zeroPort), 1)
+    }
+
+    func testUnsupportedCommandsAndInvalidRequests() async {
         await assertRequest([0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0, 80], fails: .commandNotSupported)
+        await assertRequest([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0], fails: .commandNotSupported)
         await assertRequest([0x05, 0x01, 0x00, 0x05, 0, 80], fails: .addressTypeNotSupported)
+        await assertRequest([0x05, 0x03, 0x00, 0x05, 0, 0], fails: .addressTypeNotSupported)
         await assertRequest([0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 0], fails: .invalidDestination)
         XCTAssertEqual(LocalSOCKSHandshake.Failure.commandNotSupported.replyCode, 0x07)
         XCTAssertEqual(LocalSOCKSHandshake.Failure.addressTypeNotSupported.replyCode, 0x08)

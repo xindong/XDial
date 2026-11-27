@@ -178,6 +178,29 @@ final class ProviderRelayRegistryTests: XCTestCase {
         XCTAssertEqual(registry.registeredCount, 0)
     }
 
+    func testReclassifyMovesEntryToAssociationDrainAndRejectsPostHandoff() throws {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let promoted = RelayFixture()
+        let promotedReservation = try XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(promoted.handle, to: promotedReservation))
+        XCTAssertTrue(registry.reclassify(promotedReservation, owning: .association))
+
+        let late = RelayFixture()
+        let lateReservation = try XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(late.handle, to: lateReservation))
+
+        let drain = registry.handoff(generation: "B", endpoint: "endpoint-B")
+        XCTAssertFalse(
+            registry.reclassify(lateReservation, owning: .association),
+            "post-handoff handshake must not reclassify on a replaced generation"
+        )
+        XCTAssertEqual(drain.subset(owning: .association).count, 1)
+        XCTAssertEqual(drain.subset(owning: .flow).count, 1)
+        drain.cancel()
+        XCTAssertTrue(drain.wait(timeout: 1))
+    }
+
     func testRetainedFlowsNotifyOnceWhenTheyAllFinish() async {
         let registry = ProviderRelayRegistry<String>()
         registry.activate(generation: "A", endpoint: "endpoint-A")

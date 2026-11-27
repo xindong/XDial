@@ -406,8 +406,8 @@ private struct LocalSOCKSShareSettings: View {
                 }
             }
             note(state.tr(
-                "端口只接受本机连接，无需认证，仅支持 TCP。接管系统时开关与端口立即生效；切换连接方式或修改仅 SOCKS5 的端口需要重连。",
-                "The port accepts local connections only, without authentication, TCP only. While system-wide, the switch and port apply immediately; changing the mode or the SOCKS5-only port requires reconnecting."
+                "端口只接受本机连接，无需认证，支持 TCP 与 UDP。接管系统时开关与端口立即生效；切换连接方式或修改仅 SOCKS5 的端口需要重连。",
+                "The port accepts local connections only, without authentication, for TCP and UDP. While system-wide, the switch and port apply immediately; changing the mode or the SOCKS5-only port requires reconnecting."
             ))
         }
     }

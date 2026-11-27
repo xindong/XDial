@@ -817,7 +817,13 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
             credentials: reservation.endpoint.credentials,
             trialID: reservation.generation,
             traffic: traffic,
-            logger: logger
+            logger: logger,
+            adoptUDPAssociation: { [weak self] in
+                self?.relayRegistry.reclassify(
+                    reservation,
+                    owning: .association
+                ) ?? false
+            }
         )
         guard relayRegistry.attach(handle, to: reservation) else {
             handle.cancel(with: AppProxyFlowCloseError.aborted)

@@ -72,9 +72,9 @@ IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Pro
 macOS 已绑定 flow 的接口是系统既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
 Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 Line 不继承它。
 
-本机 SOCKS5 由 Provider 持有 `127.0.0.1:<port>`，只接受本机无认证 TCP CONNECT，不设置
-系统代理、不监听其他地址。每条连接在接入时取得当前 generation 的会话入口，与系统 flow
-共用 relay 登记、换代排空和停止关闭；端口不随 Switch 重建。客户端主机名只放行可打印字节，
+本机 SOCKS5 由 Provider 持有 `127.0.0.1:<port>`，只接受本机无认证 TCP CONNECT 与
+UDP ASSOCIATE，不设置系统代理、不监听其他地址。每条连接在接入时取得当前 generation 的会话入口，与系统 flow
+共用 relay 登记、换代排空和停止关闭；端口不随 Switch 重建。客户端主机名在握手与每个 UDP 数据报中都只放行可打印字节，
 不能携带 Provider 的 flow metadata；该入口没有应用身份，只命中 Scenario 的非应用规则。
 
 连接方式是 `ConnectionReport.ingress`，由宿主在完整连接开始时按 App 偏好写入，Switch 沿用

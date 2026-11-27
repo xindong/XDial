@@ -384,6 +384,31 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         return true
     }
 
+    /// Updates an attached entry's ownership once protocol negotiation reveals
+    /// what it carries. Fails if the generation has already handed off or
+    /// deactivated so a late UDP handshake cannot remain in retained TCP flows.
+    func reclassify(
+        _ reservation: Reservation,
+        owning ownership: ProviderRelayOwnership
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard
+            case let .active(activeGeneration, _) = state,
+            activeGeneration == reservation.generation,
+            case let .attached(entryGeneration, handle, _) = entries[reservation.id],
+            entryGeneration == reservation.generation
+        else {
+            return false
+        }
+        entries[reservation.id] = .attached(
+            generation: reservation.generation,
+            handle: handle,
+            ownership: ownership
+        )
+        return true
+    }
+
     func finish(_ reservation: Reservation) {
         lock.lock()
         defer { lock.unlock() }
